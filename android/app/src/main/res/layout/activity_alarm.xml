@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Full screen alarm / disarm surface.
+
+  Deliberately a plain Android layout rather than a Flutter route: it has to be
+  able to come up over the lock screen within a few hundred milliseconds even
+  when the Flutter engine is not running at all.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/alarmRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bp_alarm_deep"
+    android:fitsSystemWindows="true">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:paddingStart="24dp"
+            android:paddingEnd="24dp"
+            android:paddingTop="36dp"
+            android:paddingBottom="28dp">
+
+            <ImageView
+                android:id="@+id/alertIcon"
+                android:layout_width="76dp"
+                android:layout_height="76dp"
+                android:src="@drawable/ic_alert"
+                android:contentDescription="@string/alarm_title_theft" />
+
+            <TextView
+                android:id="@+id/alarmTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="18dp"
+                android:gravity="center"
+                android:letterSpacing="0.06"
+                android:text="@string/alarm_title_theft"
+                android:textColor="@color/bp_foam"
+                android:textSize="30sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/alarmSubtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:text="@string/alarm_subtitle_pending"
+                android:textColor="@color/bp_foam"
+                android:alpha="0.85"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/countdownText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="center"
+                android:text="10"
+                android:textColor="@color/bp_foam"
+                android:textSize="72sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/detailText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center"
+                android:textColor="@color/bp_foam"
+                android:alpha="0.7"
+                android:textSize="14sp" />
+
+            <!-- PIN entry. Hidden entirely unless the chosen disarm mode needs it. -->
+            <TextView
+                android:id="@+id/pinDisplay"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="22dp"
+                android:letterSpacing="0.4"
+                android:textColor="@color/bp_foam"
+                android:textSize="30sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/pinError"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/wrong_pin"
+                android:textColor="@color/bp_foam"
+                android:textSize="14sp"
+                android:visibility="invisible" />
+
+            <GridLayout
+                android:id="@+id/keypad"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:columnCount="3"
+                android:visibility="gone">
+
+                <TextView android:id="@+id/key1" style="@style/KeypadButton" android:text="1" />
+                <TextView android:id="@+id/key2" style="@style/KeypadButton" android:text="2" />
+                <TextView android:id="@+id/key3" style="@style/KeypadButton" android:text="3" />
+                <TextView android:id="@+id/key4" style="@style/KeypadButton" android:text="4" />
+                <TextView android:id="@+id/key5" style="@style/KeypadButton" android:text="5" />
+                <TextView android:id="@+id/key6" style="@style/KeypadButton" android:text="6" />
+                <TextView android:id="@+id/key7" style="@style/KeypadButton" android:text="7" />
+                <TextView android:id="@+id/key8" style="@style/KeypadButton" android:text="8" />
+                <TextView android:id="@+id/key9" style="@style/KeypadButton" android:text="9" />
+                <TextView android:id="@+id/keyDelete" style="@style/KeypadButton" android:text="⌫" />
+                <TextView android:id="@+id/key0" style="@style/KeypadButton" android:text="0" />
+                <TextView android:id="@+id/keyOk" style="@style/KeypadButton" android:text="✓" />
+            </GridLayout>
+
+            <Space
+                android:layout_width="match_parent"
+                android:layout_height="18dp" />
+
+            <TextView
+                android:id="@+id/disarmButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/disarm_button"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:letterSpacing="0.12"
+                android:paddingTop="20dp"
+                android:paddingBottom="20dp"
+                android:text="@string/disarm"
+                android:textColor="@color/bp_abyss"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/biometricButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:padding="10dp"
+                android:text="@string/use_biometric"
+                android:textColor="@color/bp_foam"
+                android:alpha="0.85"
+                android:textSize="15sp"
+                android:visibility="gone" />
+        </LinearLayout>
+    </ScrollView>
+</FrameLayout>

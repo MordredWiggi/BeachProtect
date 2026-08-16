@@ -1,0 +1,225 @@
+package com.beachprotect.ble
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import com.beachprotect.guard.PowerProfile
+import com.beachprotect.guard.RadioProfile
+
+/**
+ * Listens for group beacons, and optionally for the speaker box.
+ *
+ * ## Where the battery actually goes
+ *
+ * Scanning is by far the most expensive thing this app does, so three things
+ * are true of every scan started here:
+ *
+ * 1. **It is always filtered.** A [ScanFilter] on our service UUID is pushed
+ *    down into the Bluetooth controller, so the application processor is never
+ *    woken for the hundreds of unrelated advertisements on a busy beach.
+ *
+ * 2. **It runs at the lowest duty cycle that still works.** `SCAN_MODE_LOW_POWER`
+ *    is roughly a 512 ms window every 5.12 s. The scan only escalates to
+ *    `SCAN_MODE_LOW_LATENCY` when the engine has actual evidence to chase, and
+ *    drops straight back down afterwards.
+ *
+ * 3. **Restarts are throttled.** Android silently blocks an app that starts and
+ *    stops scans more than five times in thirty seconds, and a blocked scanner
+ *    is a guard that does not work. [MIN_RESTART_INTERVAL_MS] keeps us well
+ *    under that ceiling, coalescing rapid profile changes.
+ *
+ * The box's BLE address, when known, is added as a *second* hardware filter
+ * rather than forcing an unfiltered scan - so tracking the speaker costs
+ * essentially nothing extra.
+ */
+class BleScanner(
+    private val adapter: BluetoothAdapter?,
+    private val listener: Listener,
+) {
+
+    interface Listener {
+        /** A group beacon, already RSSI-stamped but not yet authenticated. */
+        fun onServiceData(rssi: Int, payload: ByteArray, elapsedNanos: Long)
+
+        /** An advertisement from the tracked speaker box. */
+        fun onBoxAdvertisement(address: String, rssi: Int)
+
+        fun onScanFailed(errorCode: Int)
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var currentRadio: RadioProfile? = null
+    private var currentPower: PowerProfile? = null
+    private var boxAddress: String? = null
+    private var lastStartAt = 0L
+    private var pendingRestart = false
+
+    var running: Boolean = false
+        private set
+
+    private val callback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            result?.let { dispatch(it) }
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>?) {
+            results?.forEach { dispatch(it) }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            Log.w(TAG, "scan failed: $errorCode")
+            running = false
+            listener.onScanFailed(errorCode)
+            // SCAN_FAILED_APPLICATION_REGISTRATION_FAILED happens when the
+            // stack has been reset underneath us; a delayed retry recovers it.
+            handler.postDelayed({ restartNow() }, RETRY_DELAY_MS)
+        }
+    }
+
+    private fun dispatch(result: ScanResult) {
+        val payload = result.scanRecord?.getServiceData(BleAdvertiser.SERVICE_PARCEL_UUID)
+        if (payload != null) {
+            listener.onServiceData(result.rssi, payload, result.timestampNanos)
+            return
+        }
+        val address = result.device?.address ?: return
+        if (address.equals(boxAddress, ignoreCase = true)) {
+            listener.onBoxAdvertisement(address, result.rssi)
+        }
+    }
+
+    /**
+     * Applies a scan configuration, restarting the underlying scan only when
+     * something meaningful changed and the throttle allows it.
+     */
+    fun apply(radio: RadioProfile, power: PowerProfile, boxBleAddress: String?) {
+        val changed = radio != currentRadio || power != currentPower ||
+            !boxBleAddress.equals(boxAddress, ignoreCase = true)
+        currentRadio = radio
+        currentPower = power
+        boxAddress = boxBleAddress
+        if (!changed && running) return
+
+        val since = SystemClock.elapsedRealtime() - lastStartAt
+        if (running && since < MIN_RESTART_INTERVAL_MS) {
+            // Too soon. Schedule one restart for when the window opens; any
+            // further changes before then simply update the fields above.
+            if (!pendingRestart) {
+                pendingRestart = true
+                handler.postDelayed({
+                    pendingRestart = false
+                    restartNow()
+                }, MIN_RESTART_INTERVAL_MS - since)
+            }
+            return
+        }
+        restartNow()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun restartNow() {
+        val scanner = adapter?.bluetoothLeScanner
+        val radio = currentRadio ?: return
+        val power = currentPower ?: PowerProfile.BALANCED
+        if (scanner == null || adapter.state != BluetoothAdapter.STATE_ON) {
+            running = false
+            return
+        }
+
+        try {
+            if (running) scanner.stopScan(callback)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "cannot stop scan", e)
+        }
+
+        val filters = ArrayList<ScanFilter>(2)
+        filters.add(
+            ScanFilter.Builder()
+                .setServiceUuid(BleAdvertiser.SERVICE_PARCEL_UUID)
+                .build(),
+        )
+        boxAddress?.let { address ->
+            if (BluetoothAdapter.checkBluetoothAddress(address)) {
+                filters.add(ScanFilter.Builder().setDeviceAddress(address).build())
+            }
+        }
+
+        val settings = buildSettings(radio, power)
+        try {
+            scanner.startScan(filters, settings, callback)
+            running = true
+            lastStartAt = SystemClock.elapsedRealtime()
+        } catch (e: SecurityException) {
+            running = false
+            Log.w(TAG, "missing BLUETOOTH_SCAN permission", e)
+        } catch (e: IllegalStateException) {
+            running = false
+            Log.w(TAG, "bluetooth is off", e)
+        }
+    }
+
+    private fun buildSettings(radio: RadioProfile, power: PowerProfile): ScanSettings {
+        val builder = ScanSettings.Builder()
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+            // A phone being carried away gets *weaker*, which is exactly when we
+            // must keep hearing it. Sticky matching would drop it.
+            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+            .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+
+        val scanMode = when (radio) {
+            RadioProfile.ALERT, RadioProfile.CRITICAL -> ScanSettings.SCAN_MODE_LOW_LATENCY
+            RadioProfile.CALM -> when (power) {
+                PowerProfile.MAX_PROTECTION -> ScanSettings.SCAN_MODE_BALANCED
+                PowerProfile.BALANCED, PowerProfile.ULTRA_SAVER -> ScanSettings.SCAN_MODE_LOW_POWER
+            }
+        }
+        builder.setScanMode(scanMode)
+
+        // Hardware batching lets the application processor stay asleep between
+        // bursts. Only worth it while calm, and only where the chipset offers it.
+        val batchingUseful = radio == RadioProfile.CALM &&
+            power == PowerProfile.ULTRA_SAVER &&
+            adapter?.isOffloadedScanBatchingSupported == true
+        builder.setReportDelay(if (batchingUseful) BATCH_DELAY_MS else 0L)
+
+        return builder.build()
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stop() {
+        handler.removeCallbacksAndMessages(null)
+        pendingRestart = false
+        val scanner = adapter?.bluetoothLeScanner
+        if (scanner != null && running) {
+            try {
+                scanner.stopScan(callback)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "cannot stop scan", e)
+            }
+        }
+        running = false
+        currentRadio = null
+        currentPower = null
+    }
+
+    companion object {
+        private const val TAG = "BpScanner"
+
+        /**
+         * Android blocks apps that toggle scanning more than 5 times in 30 s.
+         * Six seconds between restarts keeps us comfortably legal.
+         */
+        const val MIN_RESTART_INTERVAL_MS = 6_000L
+
+        private const val RETRY_DELAY_MS = 4_000L
+        private const val BATCH_DELAY_MS = 2_500L
+    }
+}

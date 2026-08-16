@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shared with the Flutter palette in lib/core/theme.dart. Keep in sync. -->
+    <color name="bp_abyss">#FF04121F</color>
+    <color name="bp_deep">#FF071A2B</color>
+    <color name="bp_surface">#FF0F2A42</color>
+    <color name="bp_surface_high">#FF163A57</color>
+    <color name="bp_foam">#FFE8F4FA</color>
+    <color name="bp_muted">#FF8AA9BF</color>
+
+    <color name="bp_lagoon">#FF22D3EE</color>
+    <color name="bp_guard">#FF34D399</color>
+    <color name="bp_warn">#FFFBBF24</color>
+    <color name="bp_alarm">#FFF43F5E</color>
+    <color name="bp_alarm_deep">#FF7A0B22</color>
+    <color name="bp_pending_deep">#FF7A4A05</color>
+
+    <color name="bp_key">#33FFFFFF</color>
+    <color name="bp_key_pressed">#55FFFFFF</color>
+</resources>

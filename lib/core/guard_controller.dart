@@ -1,0 +1,164 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+
+import 'guard_bridge.dart';
+import 'models.dart';
+
+/// Holds the two things every screen needs: the live guard snapshot and the
+/// persisted settings.
+///
+/// Both are owned natively. This class only mirrors them, so the UI can never
+/// drift out of sync with the guard that is actually running.
+class GuardController extends ChangeNotifier {
+  GuardController({GuardBridge? bridge})
+      : _bridge = bridge ?? GuardBridge.instance;
+
+  final GuardBridge _bridge;
+
+  StreamSubscription<GuardSnapshot>? _subscription;
+
+  GuardSnapshot _snapshot = GuardSnapshot.empty;
+  GuardSettings _settings = GuardSettings.empty;
+  bool _loading = true;
+  bool _fullScreenAlarmAllowed = true;
+  Object? _error;
+
+  GuardSnapshot get snapshot => _snapshot;
+  GuardSettings get settings => _settings;
+  bool get loading => _loading;
+  Object? get error => _error;
+
+  /// False on Android 14+ until the user grants the full-screen-intent
+  /// permission. Without it the disarm screen cannot cover the lock screen and
+  /// degrades to a heads-up notification, which is easy to miss entirely.
+  bool get fullScreenAlarmAllowed => _fullScreenAlarmAllowed;
+
+  Future<void> refreshCapabilities() async {
+    try {
+      _fullScreenAlarmAllowed = await _bridge.canUseFullScreenIntent();
+      notifyListeners();
+    } catch (_) {
+      // Not fatal: the siren still works, only the lock-screen prompt suffers.
+    }
+  }
+
+  GuardBridge get bridge => _bridge;
+
+  bool get needsSetup => !_settings.hasGroup || _settings.selfName.trim().isEmpty;
+
+  Future<void> initialise() async {
+    _loading = true;
+    notifyListeners();
+    try {
+      _settings = await _bridge.getSettings();
+      if (_settings.hasGroup) {
+        await _bridge.startService();
+        final initial = await _bridge.getSnapshot();
+        if (initial != null) _snapshot = initial;
+      }
+      _listen();
+      await refreshCapabilities();
+      _error = null;
+    } catch (e) {
+      _error = e;
+    } finally {
+      _loading = false;
+      notifyListeners();
+    }
+  }
+
+  void _listen() {
+    _subscription?.cancel();
+    _subscription = _bridge.snapshots.listen(
+      (snapshot) {
+        _snapshot = snapshot;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        _error = e;
+        notifyListeners();
+      },
+    );
+  }
+
+  Future<void> refreshSettings() async {
+    _settings = await _bridge.getSettings();
+    notifyListeners();
+  }
+
+  Future<void> patch(Map<String, Object?> values) async {
+    _settings = await _bridge.updateSettings(values);
+    notifyListeners();
+  }
+
+  // ---- commands ---------------------------------------------------------
+
+  Future<void> arm() async {
+    await _bridge.arm();
+    await refreshSettings();
+  }
+
+  Future<void> disarm() async {
+    await _bridge.disarm();
+    await refreshSettings();
+  }
+
+  Future<void> armGroup() async {
+    await _bridge.armGroup();
+    await refreshSettings();
+  }
+
+  Future<void> disarmGroup() async {
+    await _bridge.disarmGroup();
+    await refreshSettings();
+  }
+
+  Future<void> clearAlarm() => _bridge.clearAlarm();
+  Future<void> panic() => _bridge.panic();
+  Future<void> testAlarm() => _bridge.testAlarm();
+
+  Future<String> createGroup({
+    required String groupName,
+    required String selfName,
+  }) async {
+    final code = await _bridge.createGroup(
+      groupName: groupName,
+      selfName: selfName,
+    );
+    await _bridge.startService();
+    await refreshSettings();
+    _listen();
+    return code;
+  }
+
+  Future<bool> joinGroup({
+    required String code,
+    required String groupName,
+    required String selfName,
+  }) async {
+    final ok = await _bridge.joinGroup(
+      code: code,
+      groupName: groupName,
+      selfName: selfName,
+    );
+    if (ok) {
+      await _bridge.startService();
+      await refreshSettings();
+      _listen();
+    }
+    return ok;
+  }
+
+  Future<void> leaveGroup() async {
+    await _bridge.leaveGroup();
+    _snapshot = GuardSnapshot.empty;
+    await refreshSettings();
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    super.dispose();
+  }
+}

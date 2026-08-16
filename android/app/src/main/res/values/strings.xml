@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BeachProtect</string>
+
+    <string name="alarm_title_pickup">PUT THIS PHONE DOWN</string>
+    <string name="alarm_title_theft">THEFT DETECTED</string>
+    <string name="alarm_title_box">SPEAKER BEING TAKEN</string>
+    <string name="alarm_title_lost">PHONE MISSING</string>
+    <string name="alarm_title_panic">PANIC ALARM</string>
+    <string name="alarm_title_test">TEST ALARM</string>
+
+    <string name="alarm_subtitle_pending">Disarm now if this is you</string>
+    <string name="alarm_subtitle_alarm">The whole group has been alerted</string>
+
+    <string name="disarm">DISARM</string>
+    <string name="enter_pin">Enter the group PIN</string>
+    <string name="wrong_pin">Wrong PIN</string>
+    <string name="use_biometric">Use fingerprint</string>
+    <string name="biometric_title">Disarm BeachProtect</string>
+    <string name="biometric_subtitle">Confirm it is really you</string>
+    <string name="delete">Delete</string>
+    <string name="confirm">OK</string>
+
+    <string name="notif_channel_guard">Guard status</string>
+    <string name="notif_channel_guard_desc">Shows that BeachProtect is watching your things.</string>
+    <string name="notif_channel_alarm">Theft alarms</string>
+    <string name="notif_channel_alarm_desc">Full screen alerts when something is being taken.</string>
+</resources>
