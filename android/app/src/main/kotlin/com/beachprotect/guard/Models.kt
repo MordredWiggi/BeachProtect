@@ -212,6 +212,26 @@ data class EngineConfig(
     val fastPathDropDb: Double get() = dropThresholdDb * 1.8
 
     /**
+     * Where an *episode* begins — which is not the same thing as where a vote
+     * becomes justified.
+     *
+     * [sustainMs] used to start counting only once the signal had already
+     * fallen the full [dropThresholdDb], so the two costs were paid one after
+     * the other: seconds of fading, and only then seconds of confirming. On a
+     * phone being walked away with, that was three seconds of pure latency.
+     *
+     * The episode now starts as soon as a *moving* peer's signal begins to
+     * recede, so the confirmation window runs alongside the fade. Voting still
+     * requires the full drop, so nothing is voted on that would not have been
+     * before — and for a step change, which is what occlusion looks like, both
+     * clocks still start on the very same sample.
+     */
+    val episodeStartDropDb: Double get() = dropThresholdDb * 0.55
+
+    /** An episode ends when the signal comes comfortably back. Hysteresis. */
+    val episodeEndDropDb: Double get() = episodeStartDropDb * 0.75
+
+    /**
      * How many of [otherPhones] must agree before an alarm is justified.
      *
      * Clamped to what is actually achievable: with two phones in the group
@@ -273,6 +293,19 @@ data class GuardSnapshot(
     val selfStationary: Boolean,
     val selfMotionScore: Int,
     val armedSinceMs: Long,
+
+    /**
+     * Whether lifting this phone would actually trigger anything yet.
+     *
+     * The pickup detector only arms once the phone has been left alone for
+     * `settleMs`. Without surfacing that, a user who arms the app and
+     * immediately waves the phone about sees "Guarding" and nothing else
+     * happening, and concludes the app is broken.
+     */
+    val pickupArmed: Boolean,
+
+    /** Milliseconds until [pickupArmed] becomes true; 0 when it already is. */
+    val pickupArmsInMs: Long,
     val pendingRemainingMs: Long,
     val alarmReason: AlarmReason?,
     val alarmSubjectId: Int,

@@ -264,6 +264,7 @@ class Diagnostics {
     required this.powerProfile,
     required this.wakeLockHeld,
     required this.serviceRunning,
+    required this.sirenAudible,
     required this.simulationRunning,
     required this.simulationScenario,
     required this.simulationNote,
@@ -282,6 +283,10 @@ class Diagnostics {
   final String powerProfile;
   final bool wakeLockHeld;
   final bool serviceRunning;
+
+  /// Whether the siren genuinely opened an audio output. False during an alarm
+  /// means the phone believes it is screaming while sitting there mutely.
+  final bool sirenAudible;
   final bool simulationRunning;
   final String? simulationScenario;
   final String simulationNote;
@@ -302,6 +307,7 @@ class Diagnostics {
     powerProfile: 'BALANCED',
     wakeLockHeld: false,
     serviceRunning: false,
+    sirenAudible: false,
     simulationRunning: false,
     simulationScenario: null,
     simulationNote: '',
@@ -335,6 +341,7 @@ class Diagnostics {
       powerProfile: map['powerProfile'] as String? ?? 'BALANCED',
       wakeLockHeld: map['wakeLockHeld'] as bool? ?? false,
       serviceRunning: map['serviceRunning'] as bool? ?? false,
+      sirenAudible: map['sirenAudible'] as bool? ?? false,
       simulationRunning: map['simulationRunning'] as bool? ?? false,
       simulationScenario: map['simulationScenario'] as String?,
       simulationNote: map['simulationNote'] as String? ?? '',
@@ -355,6 +362,8 @@ class GuardSnapshot {
     required this.selfName,
     required this.selfStationary,
     required this.selfMotionScore,
+    required this.pickupArmed,
+    required this.pickupArmsInMs,
     required this.pendingRemainingMs,
     required this.alarmReason,
     required this.alarmSubjectId,
@@ -371,6 +380,12 @@ class GuardSnapshot {
   final String selfName;
   final bool selfStationary;
   final int selfMotionScore;
+
+  /// Whether lifting this phone would actually trigger anything yet.
+  final bool pickupArmed;
+
+  /// Milliseconds until [pickupArmed] becomes true.
+  final int pickupArmsInMs;
   final int pendingRemainingMs;
   final AlarmReason? alarmReason;
   final int alarmSubjectId;
@@ -387,6 +402,8 @@ class GuardSnapshot {
     selfName: '',
     selfStationary: true,
     selfMotionScore: 0,
+    pickupArmed: false,
+    pickupArmsInMs: 0,
     pendingRemainingMs: 0,
     alarmReason: null,
     alarmSubjectId: 0,
@@ -423,6 +440,8 @@ class GuardSnapshot {
       selfName: map['selfName'] as String? ?? '',
       selfStationary: map['selfStationary'] as bool? ?? true,
       selfMotionScore: (map['selfMotionScore'] as num?)?.toInt() ?? 0,
+      pickupArmed: map['pickupArmed'] as bool? ?? false,
+      pickupArmsInMs: (map['pickupArmsInMs'] as num?)?.toInt() ?? 0,
       pendingRemainingMs: (map['pendingRemainingMs'] as num?)?.toInt() ?? 0,
       alarmReason: map['alarmReason'] == null
           ? null
@@ -539,6 +558,7 @@ class GuardSettings {
     required this.speakReason,
     required this.armed,
     required this.simulationEnabled,
+    required this.onboardingComplete,
     required this.txPowerRef,
     required this.boxEnabled,
     required this.boxAddress,
@@ -570,6 +590,11 @@ class GuardSettings {
   final bool speakReason;
   final bool armed;
   final bool simulationEnabled;
+
+  /// Whether the first-run walkthrough has been seen through to the end.
+  /// Tracked separately from [hasGroup], because the group is created at step
+  /// two of four and the rest of the setup matters just as much.
+  final bool onboardingComplete;
   final int txPowerRef;
   final bool boxEnabled;
   final String? boxAddress;
@@ -603,6 +628,7 @@ class GuardSettings {
     speakReason: true,
     armed: false,
     simulationEnabled: false,
+    onboardingComplete: false,
     txPowerRef: -59,
     boxEnabled: false,
     boxAddress: null,
@@ -659,6 +685,7 @@ class GuardSettings {
       speakReason: map['speakReason'] as bool? ?? true,
       armed: map['armed'] as bool? ?? false,
       simulationEnabled: map['simulationEnabled'] as bool? ?? false,
+      onboardingComplete: map['onboardingComplete'] as bool? ?? false,
       txPowerRef: (map['txPowerRef'] as num?)?.toInt() ?? -59,
       boxEnabled: map['boxEnabled'] as bool? ?? false,
       boxAddress: map['boxAddress'] as String?,

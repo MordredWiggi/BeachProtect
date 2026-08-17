@@ -7,6 +7,7 @@ import '../core/models.dart';
 import '../core/theme.dart';
 import '../widgets/common.dart';
 import 'box_setup_screen.dart';
+import 'permissions_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -196,6 +197,17 @@ class SettingsScreen extends StatelessWidget {
           SettingsGroup(
             title: 'System',
             children: [
+              SettingTile(
+                title: 'Permissions and setup',
+                subtitle:
+                    'What the app needs, why it needs it, and whether Android '
+                    'has actually granted it.',
+                leading: const Icon(Icons.verified_user_rounded),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const PermissionsScreen()),
+                ),
+              ),
               SettingTile(
                 title: 'Android app settings',
                 subtitle: 'Permissions, notifications, battery behaviour.',

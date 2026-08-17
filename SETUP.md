@@ -250,11 +250,13 @@ BpGuardService: ALARM THEFT_CONSENSUS subject=41377
 .\tools\test-all.ps1 -Dart        # snapshot decoding + static analysis
 ```
 
-- **49 Kotlin/JUnit tests** cover the detection rules — occlusion suppression,
-  consensus, replay protection, the pickup grace period. These run on the JVM
-  in a couple of seconds and are the fastest way to know you have not broken
-  the logic.
-- **8 Dart tests** cover snapshot decoding and the consensus rule mirror.
+- **58 Kotlin/JUnit tests** cover the detection rules — occlusion suppression,
+  consensus, replay protection, the pickup grace period, and the reaction-time
+  budgets for both the victim and the peer path. These run on the JVM in a
+  couple of seconds and are the fastest way to know you have not broken the
+  logic.
+- **9 Dart tests** cover snapshot decoding, the consensus rule mirror and
+  first-run completion.
 
 An HTML report is written to
 `build\app\reports\tests\testDebugUnitTest\index.html`.

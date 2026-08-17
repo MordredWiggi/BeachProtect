@@ -108,6 +108,23 @@ class ThreatEngine(
     private var selfStillSince = NEVER
     private var significantMotionPendingAt = 0L
 
+    /**
+     * Whether the run of movement this phone is currently in began from a
+     * properly settled, guarded state.
+     *
+     * This latch is what makes the pickup detector survive a gentle start. The
+     * readiness test reads [selfStillSince], and the very first sample that
+     * reports movement has to clear it — so without a latch, a lift that begins
+     * below [EngineConfig.motionScoreThreshold] (a slow slide off the towel, a
+     * phone lifted carefully) disarmed the detector permanently: every stronger
+     * sample that followed found "has not been lying still" and did nothing.
+     * The phone could then be carried away in total silence, and the only thing
+     * the user ever saw was the app asking them to put it down again.
+     */
+    private var motionEpisodeArmed = false
+    private var motionEpisodeSince = NEVER
+    private var motionEpisodePeak = 0
+
     // ---- box ------------------------------------------------------------
 
     private var boxConfigured = false
@@ -132,6 +149,7 @@ class ThreatEngine(
         boxBaseline.clear()
         votes.clear()
         boxAlarmFired = false
+        endMotionEpisode()
         transition(now, GuardState.CALIBRATING)
     }
 
@@ -147,6 +165,7 @@ class ThreatEngine(
         votes.clear()
         boxAlarmFired = false
         significantMotionPendingAt = 0L
+        endMotionEpisode()
         transition(now, GuardState.DISARMED)
     }
 
@@ -163,6 +182,9 @@ class ThreatEngine(
         peers.values.forEach { it.resetBaseline() }
         boxBaseline.clear()
         armedSince = now
+        // The owner has just said "that was me". Holding the latch would put
+        // the phone straight back into PENDING the moment calibration ends.
+        endMotionEpisode()
         transition(now, GuardState.CALIBRATING)
     }
 
@@ -176,12 +198,18 @@ class ThreatEngine(
     }
 
     fun configureBox(configured: Boolean, name: String?, address: String?, guardedHere: Boolean) {
+        // Pointing at a different speaker is a clean slate: any alarm already
+        // fired was about the old one. Without this a scenario that swaps in a
+        // virtual speaker inherits the previous run's "already alarmed" flag
+        // and can never fire again.
+        val changedDevice = !address.equals(boxAddress, ignoreCase = true)
         boxConfigured = configured
         boxName = name
         boxAddress = address
         boxGuardedHere = guardedHere
-        if (!configured) {
+        if (changedDevice || !configured) {
             boxLinkConnected = false
+            boxDisconnectedAt = 0L
             boxAlarmFired = false
             boxRssi.reset()
             boxBaseline.clear()
@@ -205,6 +233,14 @@ class ThreatEngine(
         if (beacon.deviceId == selfDeviceId) return
 
         val peer = peers.getOrPut(beacon.deviceId) { PeerRecord(beacon.deviceId) }
+        // How long the filter has been flying blind. Scan results arrive every
+        // five seconds or so while calm and several times a second once the
+        // radios escalate, and the filter has to be told which it is getting.
+        val sinceLastSample = if (peer.lastSeenAt == 0L) {
+            RssiKalman.NOMINAL_INTERVAL_MS
+        } else {
+            now - peer.lastSeenAt
+        }
         peer.lastSeenAt = now
         peer.flags = beacon.flags
         peer.battery = beacon.battery
@@ -219,7 +255,7 @@ class ThreatEngine(
             nameAssembler.accept(beacon)?.let { peer.name = it }
         }
 
-        val filtered = peer.kalman.update(rssi.toDouble())
+        val filtered = peer.kalman.update(rssi.toDouble(), sinceLastSample)
         peer.trend.add(now, filtered)
 
         // The baseline is only allowed to learn while everything is calm and
@@ -239,7 +275,7 @@ class ThreatEngine(
         when (signal) {
             is MotionSignal.SignificantMotion -> {
                 significantMotionPendingAt = now
-                if (isPickupDetectorArmed(now)) {
+                if (pickupDetectorReady(now)) {
                     beginPending(now)
                 } else if (state == GuardState.ARMED) {
                     noteEvidence(now)
@@ -250,22 +286,63 @@ class ThreatEngine(
                 selfMotionScore = signal.score
                 val wasStationary = selfStationary
                 selfStationary = signal.stationary
+
                 if (signal.stationary) {
                     if (!wasStationary || selfStillSince == NEVER) selfStillSince = now
-                } else {
-                    // Order matters: the pickup detector's readiness is derived
-                    // from selfStillSince, so it has to be evaluated *before*
-                    // the phone is marked as moving. Clearing it first made this
-                    // whole branch dead code, and left the slow hardware
-                    // significant-motion sensor as the only way to ever trigger.
-                    val ready = isPickupDetectorArmed(now)
-                    selfStillSince = NEVER
-                    if (ready && signal.score >= config.motionScoreThreshold) {
-                        beginPending(now)
-                    }
+                    endMotionEpisode()
+                    return
                 }
+
+                // Order matters: the pickup detector's readiness is derived
+                // from selfStillSince, so it has to be evaluated *before* the
+                // phone is marked as moving. Clearing it first made this whole
+                // branch dead code, and left the slow hardware
+                // significant-motion sensor as the only way to ever trigger.
+                if (selfStillSince != NEVER) {
+                    // First sample of a new run of movement. Whether the
+                    // detector was ready is decided *here*, once, and then held
+                    // for as long as the phone keeps moving.
+                    motionEpisodeArmed = isPickupDetectorArmed(now)
+                    motionEpisodeSince = now
+                    motionEpisodePeak = 0
+                    selfStillSince = NEVER
+                }
+                motionEpisodePeak = max(motionEpisodePeak, signal.score)
+                evaluatePickup(now)
             }
         }
+    }
+
+    /**
+     * Decides whether the movement this phone is in amounts to being picked up.
+     *
+     * Two ways in, because a lift does not always announce itself with one big
+     * sample: either a single decisive one, or a weaker one that simply does
+     * not stop. Also driven from [tick], so a phone whose sensor batches its
+     * reports - or stops sending them entirely - is still caught.
+     */
+    private fun evaluatePickup(now: Long) {
+        if (!motionEpisodeArmed || selfStationary || motionEpisodeSince == NEVER) return
+
+        if (motionEpisodePeak >= config.motionScoreThreshold) {
+            beginPending(now)
+            return
+        }
+        // Gentler than a snatch, but a phone that has been in motion for
+        // several seconds straight is not lying on a towel any more. The floor
+        // on the peak keeps a single knock to the towel out of it: that decays
+        // within a second, and only the motion monitor's settling delay keeps
+        // reporting movement afterwards.
+        val persistent = now - motionEpisodeSince >= SUSTAINED_MOTION_MS
+        if (persistent && motionEpisodePeak >= config.motionScoreThreshold / 2) {
+            beginPending(now)
+        }
+    }
+
+    private fun endMotionEpisode() {
+        motionEpisodeArmed = false
+        motionEpisodeSince = NEVER
+        motionEpisodePeak = 0
     }
 
     fun onBoxSignal(now: Long, signal: BoxSignal) {
@@ -315,6 +392,7 @@ class ThreatEngine(
             }
 
             GuardState.ARMED, GuardState.SUSPICIOUS -> {
+                evaluatePickup(now)
                 observePeers(now)
                 observeBox(now)
                 evaluateConsensus(now)
@@ -399,23 +477,28 @@ class ThreatEngine(
             // produces a flat slope again, but the signal stays down - and that
             // must still count. Once an episode has begun it ends only when the
             // signal genuinely comes back (the reset below).
+            //
+            // The episode starts at a *fraction* of the full threshold, so the
+            // sustain window runs while the phone is still receding instead of
+            // only afterwards. Voting still needs the whole drop, so this
+            // changes nothing about what counts as theft - only about how long
+            // it takes to say so. For occlusion, which is a step rather than a
+            // fade, both clocks still start on the same sample.
             val episodeRunning = peer.dropStartedAt != 0L
-            if (dropping && (episodeRunning || slope <= config.minNegativeSlope)) {
-                if (peer.dropStartedAt == 0L) peer.dropStartedAt = now
+            val starting = drop >= config.episodeStartDropDb && slope <= config.minNegativeSlope
+            val continuing = episodeRunning && drop >= config.episodeEndDropDb
+
+            if (starting || continuing) {
+                if (!episodeRunning) peer.dropStartedAt = now
                 noteEvidence(now)
                 val needed = if (drop >= config.fastPathDropDb) config.sustainMs / 2 else config.sustainMs
-                if (now - peer.dropStartedAt >= needed) {
+                if (dropping && now - peer.dropStartedAt >= needed) {
                     castOwnVote(now, peer.deviceId, VoteType.SUSPECT)
                 }
             } else {
-                if (drop < config.dropThresholdDb * 0.6) {
-                    // Comfortably back to normal - forget the whole episode.
-                    peer.dropStartedAt = 0L
-                    clearOwnVote(peer.deviceId)
-                } else {
-                    // Moving peer, signal softening but not yet conclusive.
-                    noteEvidence(now)
-                }
+                // Comfortably back to normal - forget the whole episode.
+                peer.dropStartedAt = 0L
+                clearOwnVote(peer.deviceId)
             }
         }
     }
@@ -540,6 +623,15 @@ class ThreatEngine(
         if (selfStillSince == NEVER) return false
         return now - selfStillSince >= config.settleMs
     }
+
+    /**
+     * As above, but true throughout a run of movement that began while it was.
+     *
+     * This is the one the trigger and the UI both use: a phone that is in the
+     * air right now is still protected, and must not report otherwise.
+     */
+    private fun pickupDetectorReady(now: Long): Boolean =
+        isPickupDetectorArmed(now) || motionEpisodeArmed
 
     private fun beginPending(now: Long) {
         if (state == GuardState.PENDING || state == GuardState.ALARM) return
@@ -773,6 +865,12 @@ class ThreatEngine(
             selfStationary = selfStationary,
             selfMotionScore = selfMotionScore,
             armedSinceMs = armedSince,
+            pickupArmed = pickupDetectorReady(now),
+            pickupArmsInMs = when {
+                state == GuardState.DISARMED -> 0L
+                selfStillSince == NEVER -> config.settleMs
+                else -> (config.settleMs - (now - selfStillSince)).coerceAtLeast(0)
+            },
             pendingRemainingMs = if (state == GuardState.PENDING) {
                 (config.pickupGraceMs - (now - pendingSince)).coerceAtLeast(0)
             } else 0L,
@@ -819,6 +917,13 @@ class ThreatEngine(
 
         /** Calibration shortcut when no peers exist to calibrate against. */
         const val SOLO_CALIBRATION_MS = 2_000L
+
+        /**
+         * Continuous movement that counts as a pickup even without a decisive
+         * sample. Comfortably longer than the motion monitor's settling delay,
+         * so a single knock cannot reach it.
+         */
+        const val SUSTAINED_MOTION_MS = 3_000L
 
         /** Peers unheard for this long are dropped from the UI entirely. */
         const val PEER_FORGET_MS = 5 * 60_000L

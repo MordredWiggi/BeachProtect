@@ -2,6 +2,7 @@ package com.beachprotect
 
 import com.beachprotect.ble.Protocol
 import com.beachprotect.guard.AlarmReason
+import com.beachprotect.guard.BoxSignal
 import com.beachprotect.guard.EngineConfig
 import com.beachprotect.guard.GuardState
 import com.beachprotect.guard.GuardWarning
@@ -101,6 +102,40 @@ class ThreatEngineTest {
         assertTrue("a receding, moving phone must alarm", h.recorder.alarmed)
         assertEquals(AlarmReason.THEFT_CONSENSUS, h.recorder.firstReason)
         assertEquals(PEER_A, h.recorder.alarms.first().second)
+    }
+
+    /**
+     * The peer path against the reaction-time budget.
+     *
+     * The fade here is not a hand-picked ramp: it is what the log-distance path
+     * loss model says a phone walking away at 1.3 m/s actually looks like, and
+     * it is the same curve the in-app simulator now plays. The peer path used
+     * to need nearly nine seconds for this, because the filter lagged by three
+     * and the confirmation window only started once the drop was already
+     * complete.
+     */
+    @Test
+    fun `a peer walking away is caught within the reaction budget`() {
+        val h = Harness()
+        h.armAndCalibrate(rssi = -58)
+        val startedAt = h.now
+
+        h.advance(12_000, stepMs = 1_000) { t ->
+            val seconds = (t - startedAt) / 1000.0
+            val metres = 1.5 + 1.3 * seconds
+            val rssi = -58.0 - 25.0 * kotlin.math.log10(metres / 1.5)
+            h.engine.onPeerBeacon(
+                t, rssi.toInt(),
+                beacon(PEER_A, stationary = false, motionScore = 190),
+            )
+        }
+
+        assertTrue(h.recorder.alarmed)
+        val elapsed = h.recorder.alarmAtMs - startedAt
+        assertTrue(
+            "expected the group to know inside 5s, took ${elapsed}ms",
+            elapsed <= 5_000,
+        )
     }
 
     @Test
@@ -301,6 +336,130 @@ class ThreatEngineTest {
         )
     }
 
+    /**
+     * Regression test, second round.
+     *
+     * A lift does not always start with a bang. The readiness test reads "has
+     * been lying still since", and the very first sample that reports movement
+     * has to clear it - so a lift that began below the decisive threshold (a
+     * careful hand, a slow slide off the towel) disarmed the detector for good:
+     * every stronger sample that followed found a phone that had not been lying
+     * still, and did nothing at all. The phone could then be carried away in
+     * silence, and all the owner ever saw was the app asking them to put it
+     * down so it could start guarding again.
+     */
+    @Test
+    fun `a lift that starts gently still trips the pickup detector`() {
+        val h = Harness()
+        h.armAndSettle()
+
+        // Below motionScoreThreshold: not enough on its own.
+        h.engine.onSelfMotion(h.now, MotionSignal.Level(18, stationary = false))
+        assertNotEquals(GuardState.PENDING, h.engine.state)
+
+        // ...and now it is properly in the air.
+        h.advance(400, stepMs = 200) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(140, stationary = false))
+        }
+
+        assertEquals(
+            "a gentle first sample must not disarm the detector",
+            GuardState.PENDING, h.engine.state,
+        )
+    }
+
+    @Test
+    fun `movement that never stops counts as a pickup even without a hard sample`() {
+        val h = Harness()
+        h.armAndSettle()
+
+        // Nothing decisive, but it simply does not stop - a phone being slid
+        // off a towel into a bag rather than snatched.
+        h.advance(3_500, stepMs = 200) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(20, stationary = false))
+        }
+        assertEquals(
+            "sustained handling should start the countdown",
+            GuardState.PENDING, h.engine.state,
+        )
+
+        h.advance(4_000, stepMs = 200) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(20, stationary = false))
+        }
+
+        assertTrue(h.recorder.alarmed)
+        assertEquals(AlarmReason.PICKUP_UNCONFIRMED, h.recorder.firstReason)
+    }
+
+    @Test
+    fun `a knock to the towel does not trip the pickup detector`() {
+        val h = Harness()
+        h.armAndSettle()
+
+        // Somebody drops a bag next to the phone: a short shove, then the
+        // motion monitor's settling delay keeps saying "moving" for a moment.
+        h.advance(2_000, stepMs = 200) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(20, stationary = false))
+        }
+        h.advance(6_000, stepMs = 200) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(0, stationary = true))
+        }
+
+        assertFalse("a knock is not a theft", h.recorder.alarmed)
+        assertNotEquals(GuardState.PENDING, h.engine.state)
+    }
+
+    /**
+     * The lone-phone case.
+     *
+     * With nobody else in the group there is no radio evidence to be had at
+     * all, so the accelerometer is the entire detector. It still has to work:
+     * plenty of people will install this, arm it, and only later persuade a
+     * friend to join.
+     */
+    @Test
+    fun `a single phone with no peers still alarms when lifted`() {
+        val h = Harness()
+        h.settle()
+        h.engine.arm(h.now)
+
+        // Nothing to calibrate against, so it should not sit in CALIBRATING.
+        h.advance(4_000, stepMs = 500)
+        assertEquals(GuardState.ARMED, h.engine.state)
+
+        // Leave it alone long enough for the pickup detector to arm.
+        h.advance(10_000, stepMs = 500)
+
+        h.engine.onSelfMotion(h.now, MotionSignal.Level(170, stationary = false))
+        assertEquals(GuardState.PENDING, h.engine.state)
+
+        h.advance(5_000, stepMs = 250) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(170, stationary = false))
+        }
+
+        assertTrue("a lone phone must still defend itself", h.recorder.alarmed)
+        assertEquals(AlarmReason.PICKUP_UNCONFIRMED, h.recorder.firstReason)
+    }
+
+    @Test
+    fun `a lone phone reports when its pickup detector is ready`() {
+        val h = Harness()
+        h.settle()
+        h.engine.arm(h.now)
+        h.advance(4_000, stepMs = 500)
+
+        assertFalse(
+            "should not claim to be ready during the settle window",
+            h.engine.snapshot(h.now).pickupArmed,
+        )
+
+        h.advance(10_000, stepMs = 500)
+        assertTrue(
+            "should be ready once it has lain still",
+            h.engine.snapshot(h.now).pickupArmed,
+        )
+    }
+
     @Test
     fun `a lifted phone alarms well inside the detection budget`() {
         val h = Harness()
@@ -442,6 +601,72 @@ class ThreatEngineTest {
 
         assertFalse(h.recorder.alarmed)
         assertNotEquals(GuardState.ALARM, h.engine.state)
+    }
+
+    // =====================================================================
+    // The speaker
+    // =====================================================================
+
+    @Test
+    fun `a guarded speaker dropping its link raises the alarm`() {
+        val h = Harness()
+        h.engine.configureBox(
+            configured = true,
+            name = "Test speaker",
+            address = "F0:00:00:00:BE:EF",
+            guardedHere = true,
+        )
+        h.armAndCalibrate()
+
+        h.engine.onBoxSignal(h.now, BoxSignal.Connected)
+        h.advance(2_000, stepMs = 500) { t -> h.engine.onPeerBeacon(t, -60, beacon(PEER_A)) }
+        h.engine.onBoxSignal(h.now, BoxSignal.Disconnected)
+        h.advance(5_000, stepMs = 500) { t -> h.engine.onPeerBeacon(t, -60, beacon(PEER_A)) }
+
+        assertTrue(h.recorder.alarmed)
+        assertEquals(AlarmReason.BOX_TAKEN, h.recorder.firstReason)
+    }
+
+    @Test
+    fun `a speaker that was never connected cannot raise a disconnect alarm`() {
+        val h = Harness()
+        h.engine.configureBox(
+            configured = true,
+            name = "Test speaker",
+            address = "F0:00:00:00:BE:EF",
+            guardedHere = true,
+        )
+        h.armAndCalibrate()
+
+        // No Connected first, so there is no link to lose. Firing here would
+        // mean alarming about a speaker nobody ever switched on.
+        h.engine.onBoxSignal(h.now, BoxSignal.Disconnected)
+        h.advance(8_000, stepMs = 500) { t -> h.engine.onPeerBeacon(t, -60, beacon(PEER_A)) }
+
+        assertFalse(h.recorder.alarmed)
+    }
+
+    @Test
+    fun `pointing at a different speaker clears a previous box alarm`() {
+        val h = Harness()
+        h.engine.configureBox(true, "One", "AA:AA:AA:AA:AA:AA", guardedHere = true)
+        h.armAndCalibrate()
+        h.engine.onBoxSignal(h.now, BoxSignal.Connected)
+        h.advance(1_000, stepMs = 500)
+        h.engine.onBoxSignal(h.now, BoxSignal.Disconnected)
+        h.advance(5_000, stepMs = 500)
+        assertTrue(h.recorder.alarmed)
+
+        h.engine.clearAlarm(h.now)
+        // A different speaker must be a clean slate, not "already alarmed".
+        h.engine.configureBox(true, "Two", "BB:BB:BB:BB:BB:BB", guardedHere = true)
+        h.advance(10_000, stepMs = 500)
+        h.engine.onBoxSignal(h.now, BoxSignal.Connected)
+        h.advance(1_000, stepMs = 500)
+        h.engine.onBoxSignal(h.now, BoxSignal.Disconnected)
+        h.advance(5_000, stepMs = 500)
+
+        assertEquals(2, h.recorder.alarms.size)
     }
 
     // =====================================================================

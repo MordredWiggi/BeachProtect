@@ -95,7 +95,7 @@ With more phones:
 A guided eight-step field protocol with synchronised log capture from every
 device.
 
-Automated suites — 49 Kotlin tests on the detection engine, 8 Dart tests on
+Automated suites — 58 Kotlin tests on the detection engine, 9 Dart tests on
 snapshot decoding:
 
 ```powershell

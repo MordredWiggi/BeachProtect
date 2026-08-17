@@ -372,7 +372,15 @@ class GuardService : Service(),
 
     private val tickRunnable = Runnable {
         tickScheduled = false
-        doTick()
+        // The tick loop reschedules itself, so an exception escaping here would
+        // stop the guard permanently and silently - armed on screen, dead in
+        // fact. Nothing is worth that, so failures are logged and the loop
+        // carries on.
+        try {
+            doTick()
+        } catch (e: Exception) {
+            Log.e(TAG, "guard tick failed", e)
+        }
         scheduleTick()
     }
 
@@ -598,19 +606,32 @@ class GuardService : Service(),
     ) {
         simulationResults[scenario.name] = verdict.name
         if (timeToAlarmMs >= 0) simulationTimings[scenario.name] = timeToAlarmMs
-        // Leave no virtual peers or half-finished alarm behind.
-        if (engine.state == GuardState.ALARM) engine.clearAlarm(now())
+        // Leave no virtual peers, virtual speaker or half-finished alarm behind.
+        stopSimulation()
         publishSnapshot()
     }
 
-    /** Stops a rehearsal and puts the guard back exactly as it was. */
+    /**
+     * Stops a rehearsal and puts the guard back exactly as it was.
+     *
+     * Deliberately not gated on `simulator.running`: a scenario that ends by
+     * itself has already cleared that flag, and the tidy-up below still has to
+     * happen or the phone is left armed and holding a simulated speaker.
+     */
     private fun stopSimulation() {
-        if (!simulator.running) return
         simulator.stop()
         if (engine.state == GuardState.ALARM) engine.clearAlarm(now())
         if (!store.armed && engine.state != GuardState.DISARMED) {
             engine.disarm(now())
         }
+        // Restore the real speaker configuration, which a scenario may have
+        // replaced with a virtual one.
+        engine.configureBox(
+            configured = store.boxEnabled && store.boxAddress != null,
+            name = store.boxName,
+            address = store.boxAddress,
+            guardedHere = boxGuard.guardingHere,
+        )
     }
 
     override fun onSimulationProgress(
@@ -965,6 +986,7 @@ class GuardService : Service(),
         "powerProfile" to store.powerProfile.name,
         "wakeLockHeld" to (wakeLock?.isHeld == true),
         "serviceRunning" to started,
+        "sirenAudible" to alarmPlayer.sirenAudible,
         "simulationRunning" to simulator.running,
         "simulationScenario" to simulator.activeScenario?.name,
         "simulationNote" to simulationNote,

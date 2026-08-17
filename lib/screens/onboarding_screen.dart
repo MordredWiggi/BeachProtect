@@ -1,10 +1,10 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
 import '../core/guard_controller.dart';
 import '../core/theme.dart';
+import 'permissions_screen.dart';
 import 'qr_scan_screen.dart';
 
 /// First-run flow.
@@ -13,6 +13,18 @@ import 'qr_scan_screen.dart';
 /// are, which group, how you prove it is you, and what Android needs to let the
 /// guard run. Nothing here can be skipped in a way that leaves a guard that
 /// silently does not work.
+///
+/// The permissions walkthrough is deliberately *inside* the first run rather
+/// than something to discover later. Three of the six grants live in Android's
+/// own settings app, and an app that never asks is an app whose guard is
+/// suspended by the battery manager an hour later, with nothing on screen to
+/// say why.
+///
+/// Completion is recorded natively, not inferred. It used to be inferred from
+/// "does a group exist", which becomes true at step two - so the root widget
+/// swapped the whole flow out for the home screen the instant the group was
+/// created, and the user got two steps of a four step progress bar and never
+/// saw the PIN or permissions pages at all.
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
 
@@ -21,7 +33,7 @@ class OnboardingScreen extends StatefulWidget {
 }
 
 class _OnboardingScreenState extends State<OnboardingScreen> {
-  final _pageController = PageController();
+  late final PageController _pageController;
   final _nameController = TextEditingController();
   final _groupNameController = TextEditingController(text: 'Beach day');
   final _codeController = TextEditingController();
@@ -31,6 +43,22 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   bool _joining = false;
   bool _busy = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    // A first run that was interrupted - the phone rang, Android's own
+    // settings app took over for the battery exemption - resumes where it
+    // stopped, rather than asking again for a name and a group that already
+    // exist.
+    final settings = context.read<GuardController>().settings;
+    if (settings.selfName.isNotEmpty) _nameController.text = settings.selfName;
+    if (settings.groupName.isNotEmpty) {
+      _groupNameController.text = settings.groupName;
+    }
+    if (settings.hasGroup) _page = settings.hasPin ? 3 : 2;
+    _pageController = PageController(initialPage: _page);
+  }
 
   @override
   void dispose() {
@@ -53,6 +81,22 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final pages = <Widget>[
+      _welcomePage(),
+      _groupPage(),
+      _pinPage(),
+      PermissionsScreen(
+        showAppBar: false,
+        onFinished: () async {
+          final controller = context.read<GuardController>();
+          await controller.bridge.startService();
+          // Recorded last, and only here: this is the one moment we know the
+          // whole walkthrough has actually been seen.
+          await controller.completeOnboarding();
+        },
+      ),
+    ];
+
     return Scaffold(
       body: SafeArea(
         child: Column(
@@ -61,7 +105,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
               child: Row(
                 children: [
-                  for (var i = 0; i < 4; i++) ...[
+                  for (var i = 0; i < pages.length; i++) ...[
                     Expanded(
                       child: AnimatedContainer(
                         duration: const Duration(milliseconds: 250),
@@ -74,8 +118,38 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                         ),
                       ),
                     ),
-                    if (i < 3) const SizedBox(width: 6),
+                    if (i < pages.length - 1) const SizedBox(width: 6),
                   ],
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Step ${_page + 1} of ${pages.length}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.3,
+                      color: context.colors.onSurface.withValues(alpha: 0.5),
+                    ),
+                  ),
+                  // Only from the group page: every later step has already
+                  // written something (a group, a PIN) that going back would
+                  // offer to create a second time.
+                  if (_page == 1)
+                    TextButton(
+                      onPressed: () => _go(_page - 1),
+                      style: TextButton.styleFrom(
+                        minimumSize: const Size(0, 32),
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: const Text('Back'),
+                    ),
                 ],
               ),
             ),
@@ -83,12 +157,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               child: PageView(
                 controller: _pageController,
                 physics: const NeverScrollableScrollPhysics(),
-                children: [
-                  _welcomePage(),
-                  _groupPage(),
-                  _pinPage(),
-                  const _PermissionsPage(),
-                ],
+                children: pages,
               ),
             ),
           ],
@@ -178,6 +247,17 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           decoration: const InputDecoration(
             labelText: 'Your name',
             helperText: 'Shown to the others. Up to 12 characters.',
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          'Then: your group, a PIN for switching the guard off, and the '
+          'permissions Android needs before any of it can run. About a minute '
+          'in total, and it is all explained as you go.',
+          style: TextStyle(
+            fontSize: 13,
+            height: 1.4,
+            color: context.colors.onSurface.withValues(alpha: 0.6),
           ),
         ),
       ],
@@ -416,261 +496,6 @@ class _Bullet extends StatelessWidget {
               ],
             ),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-/// Final onboarding step, and also reachable later from Settings.
-class _PermissionsPage extends StatefulWidget {
-  const _PermissionsPage();
-
-  @override
-  State<_PermissionsPage> createState() => _PermissionsPageState();
-}
-
-class _PermissionsPageState extends State<_PermissionsPage> {
-  bool _bluetoothGranted = false;
-  bool _notificationsGranted = false;
-  bool _batteryExempt = false;
-  bool _fullScreenAllowed = true;
-  bool _bluetoothOn = false;
-  bool _checking = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _refresh();
-  }
-
-  Future<void> _refresh() async {
-    final controller = context.read<GuardController>();
-    final scan = await Permission.bluetoothScan.status;
-    final advertise = await Permission.bluetoothAdvertise.status;
-    final connect = await Permission.bluetoothConnect.status;
-    final location = await Permission.locationWhenInUse.status;
-    final notifications = await Permission.notification.status;
-
-    // Android 12 split Bluetooth out of the location permission. On anything
-    // older, a BLE scan is still legally a location request.
-    final bluetoothOk = (scan.isGranted && advertise.isGranted && connect.isGranted) ||
-        location.isGranted;
-
-    final exempt = await controller.bridge.isIgnoringBatteryOptimizations();
-    final fullScreen = await controller.bridge.canUseFullScreenIntent();
-    final btOn = await controller.bridge.bluetoothEnabled();
-
-    if (!mounted) return;
-    setState(() {
-      _bluetoothGranted = bluetoothOk;
-      _notificationsGranted = notifications.isGranted;
-      _batteryExempt = exempt;
-      _fullScreenAllowed = fullScreen;
-      _bluetoothOn = btOn;
-      _checking = false;
-    });
-  }
-
-  Future<void> _requestBluetooth() async {
-    await [
-      Permission.bluetoothScan,
-      Permission.bluetoothAdvertise,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ].request();
-    await _refresh();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final ready = _bluetoothGranted && _notificationsGranted && _bluetoothOn;
-    final controller = context.read<GuardController>();
-
-    return Column(
-      children: [
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(22, 24, 22, 12),
-            children: [
-              const Text(
-                'Let it do its job',
-                style: TextStyle(fontSize: 27, fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'The first two are required. The last two are what stop Android '
-                'from quietly killing the guard while you swim.',
-                style: TextStyle(
-                  fontSize: 15,
-                  height: 1.45,
-                  color: context.colors.onSurface.withValues(alpha: 0.68),
-                ),
-              ),
-              const SizedBox(height: 24),
-              if (_checking)
-                const Center(child: Padding(
-                  padding: EdgeInsets.all(24),
-                  child: CircularProgressIndicator(),
-                ))
-              else ...[
-                _PermissionRow(
-                  icon: Icons.bluetooth_rounded,
-                  title: 'Bluetooth',
-                  body: 'Required. The entire protocol runs on Bluetooth LE '
-                      'advertising - no internet, no accounts.',
-                  granted: _bluetoothGranted,
-                  onFix: _requestBluetooth,
-                ),
-                _PermissionRow(
-                  icon: Icons.power_settings_new_rounded,
-                  title: 'Bluetooth switched on',
-                  body: 'Nothing works while the radio is off.',
-                  granted: _bluetoothOn,
-                  onFix: () async {
-                    await controller.bridge.requestEnableBluetooth();
-                    await Future<void>.delayed(const Duration(seconds: 2));
-                    await _refresh();
-                  },
-                ),
-                _PermissionRow(
-                  icon: Icons.notifications_rounded,
-                  title: 'Notifications',
-                  body: 'Required. Android only lets an app run in the '
-                      'background if it shows an ongoing notification.',
-                  granted: _notificationsGranted,
-                  onFix: () async {
-                    await Permission.notification.request();
-                    await _refresh();
-                  },
-                ),
-                _PermissionRow(
-                  icon: Icons.battery_charging_full_rounded,
-                  title: 'Ignore battery optimisation',
-                  body: 'Strongly recommended. Without it Android may put the '
-                      'guard to sleep after a while, which is exactly when you '
-                      'are furthest from your towel.',
-                  granted: _batteryExempt,
-                  optional: true,
-                  onFix: () async {
-                    await controller.bridge.requestIgnoreBatteryOptimizations();
-                    await Future<void>.delayed(const Duration(seconds: 1));
-                    await _refresh();
-                  },
-                ),
-                _PermissionRow(
-                  icon: Icons.screen_lock_portrait_rounded,
-                  title: 'Full screen alarms',
-                  body: 'Lets the disarm screen appear over the lock screen. '
-                      'Without it you still get a heads-up notification and the '
-                      'siren still sounds.',
-                  granted: _fullScreenAllowed,
-                  optional: true,
-                  onFix: () async {
-                    await controller.bridge.openFullScreenIntentSettings();
-                    await Future<void>.delayed(const Duration(seconds: 1));
-                    await _refresh();
-                  },
-                ),
-              ],
-            ],
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(22, 8, 22, 20),
-          child: Column(
-            children: [
-              FilledButton(
-                onPressed: ready
-                    ? () async {
-                        await controller.bridge.startService();
-                        await controller.refreshSettings();
-                      }
-                    : null,
-                child: const Text('Done'),
-              ),
-              if (!ready)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Text(
-                    'Grant Bluetooth, notifications and switch Bluetooth on to finish.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: context.colors.onSurface.withValues(alpha: 0.55),
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _PermissionRow extends StatelessWidget {
-  const _PermissionRow({
-    required this.icon,
-    required this.title,
-    required this.body,
-    required this.granted,
-    required this.onFix,
-    this.optional = false,
-  });
-
-  final IconData icon;
-  final String title;
-  final String body;
-  final bool granted;
-  final bool optional;
-  final Future<void> Function() onFix;
-
-  @override
-  Widget build(BuildContext context) {
-    final tint = granted
-        ? context.status.armed
-        : optional
-            ? context.status.suspicious
-            : context.status.alarm;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: context.colors.surfaceContainer,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: context.status.hairline),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(granted ? Icons.check_circle_rounded : icon, color: tint, size: 22),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title,
-                    style: const TextStyle(
-                        fontSize: 15, fontWeight: FontWeight.w700)),
-                const SizedBox(height: 3),
-                Text(
-                  body,
-                  style: TextStyle(
-                    fontSize: 13,
-                    height: 1.38,
-                    color: context.colors.onSurface.withValues(alpha: 0.62),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (!granted)
-            TextButton(
-              onPressed: onFix,
-              style: TextButton.styleFrom(foregroundColor: tint),
-              child: const Text('Allow'),
-            ),
         ],
       ),
     );

@@ -24,6 +24,8 @@ object Codec {
         "selfName" to snapshot.selfName,
         "selfStationary" to snapshot.selfStationary,
         "selfMotionScore" to snapshot.selfMotionScore,
+        "pickupArmed" to snapshot.pickupArmed,
+        "pickupArmsInMs" to snapshot.pickupArmsInMs,
         "pendingRemainingMs" to snapshot.pendingRemainingMs,
         "alarmReason" to snapshot.alarmReason?.name,
         "alarmSubjectId" to snapshot.alarmSubjectId,

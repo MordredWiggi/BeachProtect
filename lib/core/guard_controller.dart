@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 
 import 'guard_bridge.dart';
 import 'models.dart';
+import 'permissions.dart';
 
 /// Holds the two things every screen needs: the live guard snapshot and the
 /// persisted settings.
@@ -20,6 +21,7 @@ class GuardController extends ChangeNotifier {
 
   GuardSnapshot _snapshot = GuardSnapshot.empty;
   GuardSettings _settings = GuardSettings.empty;
+  PermissionState _permissions = const PermissionState.unknown();
   bool _loading = true;
   bool _fullScreenAlarmAllowed = true;
   Object? _error;
@@ -28,6 +30,10 @@ class GuardController extends ChangeNotifier {
   GuardSettings get settings => _settings;
   bool get loading => _loading;
   Object? get error => _error;
+
+  /// What Android currently allows. Re-read whenever the app comes back to the
+  /// foreground, because half of these are granted in another app entirely.
+  PermissionState get permissions => _permissions;
 
   /// False on Android 14+ until the user grants the full-screen-intent
   /// permission. Without it the disarm screen cannot cover the lock screen and
@@ -43,9 +49,27 @@ class GuardController extends ChangeNotifier {
     }
   }
 
+  Future<void> refreshPermissions() async {
+    try {
+      _permissions = await readPermissions(_bridge);
+      _fullScreenAlarmAllowed = _permissions[Need.fullScreen];
+      notifyListeners();
+    } catch (_) {
+      // Leave the previous answer in place rather than claiming everything is
+      // missing because one platform call went wrong.
+    }
+  }
+
   GuardBridge get bridge => _bridge;
 
-  bool get needsSetup => !_settings.hasGroup || _settings.selfName.trim().isEmpty;
+  /// The first run is only over once the walkthrough has been seen through to
+  /// the end — not merely once a group exists, which is only step two of four.
+  bool get needsSetup =>
+      !_settings.hasGroup ||
+      _settings.selfName.trim().isEmpty ||
+      !_settings.onboardingComplete;
+
+  Future<void> completeOnboarding() => patch({'onboardingComplete': true});
 
   Future<void> initialise() async {
     _loading = true;
@@ -58,7 +82,7 @@ class GuardController extends ChangeNotifier {
         if (initial != null) _snapshot = initial;
       }
       _listen();
-      await refreshCapabilities();
+      await refreshPermissions();
       _error = null;
     } catch (e) {
       _error = e;

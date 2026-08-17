@@ -12,13 +12,28 @@ import kotlin.math.pow
  * and a raw sample is far too noisy to threshold on. A Kalman filter gives us
  * both: it settles tightly when the signal is stable, and opens up quickly when
  * the signal genuinely starts to move.
+ *
+ * ## Why the process noise is per *second* and not per sample
+ *
+ * The filter used to add a fixed amount of process noise on every update, which
+ * silently assumed that samples arrive at a constant rate. They do not: the
+ * scanner runs at roughly one result every five seconds while calm and several
+ * a second once it escalates. With a per-sample constant, the filter lagged a
+ * moving peer by three to four *seconds* at the slow rate - and that lag went
+ * straight onto the detection time, because a lagging estimate reaches the drop
+ * threshold late.
+ *
+ * Scaling the process noise by the elapsed time fixes that: the filter opens up
+ * in proportion to how long it has been flying blind, so the lag stays near a
+ * second whatever the sample rate, while a burst of fast samples is still
+ * smoothed hard.
  */
 class RssiKalman(
     /**
-     * How much genuine movement we expect between samples. Raising this makes
-     * the filter trust new measurements more.
+     * How much genuine movement we expect per second. Raising this makes the
+     * filter trust new measurements more.
      */
-    private val processNoise: Double = 0.5,
+    private val processNoisePerSecond: Double = 2.0,
     /**
      * Variance of the RSSI noise itself. Real phone-to-phone RSSI on sand sits
      * around sigma = 2.5 dB, hence ~6.
@@ -31,13 +46,23 @@ class RssiKalman(
 
     val initialised: Boolean get() = !value.isNaN()
 
-    fun update(measurement: Double): Double {
+    /**
+     * @param sinceLastSampleMs how long ago the previous sample arrived. The
+     *   default is the nominal advertising interval, for callers that do not
+     *   track it.
+     */
+    @JvmOverloads
+    fun update(measurement: Double, sinceLastSampleMs: Long = NOMINAL_INTERVAL_MS): Double {
         if (!initialised) {
             value = measurement
             covariance = measurementNoise
             return value
         }
-        covariance += processNoise
+        // Clamped at both ends: a burst of samples milliseconds apart must not
+        // freeze the filter, and coming back from a two minute gap should open
+        // it up wide but not throw the estimate away entirely.
+        val seconds = sinceLastSampleMs.coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS) / 1000.0
+        covariance += processNoisePerSecond * seconds
         val gain = covariance / (covariance + measurementNoise)
         value += gain * (measurement - value)
         covariance *= (1 - gain)
@@ -47,6 +72,13 @@ class RssiKalman(
     fun reset() {
         value = Double.NaN
         covariance = 1.0
+    }
+
+    companion object {
+        /** Assumed spacing when the caller does not know. One advertisement. */
+        const val NOMINAL_INTERVAL_MS = 250L
+        private const val MIN_INTERVAL_MS = 50L
+        private const val MAX_INTERVAL_MS = 4_000L
     }
 }
 
@@ -96,34 +128,54 @@ class RollingMedian(private val capacity: Int) {
  * actually being carried away produces a sustained negative slope. Requiring
  * the slope to be negative removes a whole class of false alarms that a pure
  * threshold would trip on.
+ *
+ * The window is bounded in *time* as well as in samples. Bounding it only by
+ * sample count meant the window was four seconds long while the radio was busy
+ * and nearly half a minute while it was idle, so the same phrase — "the signal
+ * is still falling" — quietly meant two different things depending on the scan
+ * duty cycle, and a single step down kept reporting a negative slope long after
+ * the signal had settled.
  */
-class TrendEstimator(private val capacity: Int = 16) {
+class TrendEstimator(
+    private val capacity: Int = 16,
+    private val windowMs: Long = 5_000,
+) {
     private val values = DoubleArray(capacity)
     private val times = DoubleArray(capacity)
     private var count = 0
     private var writeIndex = 0
+    private var latestMs = 0L
 
     fun add(timestampMs: Long, value: Double) {
         values[writeIndex] = value
         times[writeIndex] = timestampMs / 1000.0
         writeIndex = (writeIndex + 1) % capacity
         if (count < capacity) count++
+        latestMs = timestampMs
     }
 
     /** dB per second; negative means the peer is getting further away. */
     fun slopePerSecond(): Double {
         if (count < 4) return 0.0
+        val oldest = (latestMs - windowMs) / 1000.0
+
+        var used = 0
         var sumT = 0.0
         var sumV = 0.0
         for (i in 0 until count) {
+            if (times[i] < oldest) continue
+            used++
             sumT += times[i]
             sumV += values[i]
         }
-        val meanT = sumT / count
-        val meanV = sumV / count
+        if (used < 4) return 0.0
+
+        val meanT = sumT / used
+        val meanV = sumV / used
         var num = 0.0
         var den = 0.0
         for (i in 0 until count) {
+            if (times[i] < oldest) continue
             val dt = times[i] - meanT
             num += dt * (values[i] - meanV)
             den += dt * dt
@@ -134,6 +186,7 @@ class TrendEstimator(private val capacity: Int = 16) {
     fun clear() {
         count = 0
         writeIndex = 0
+        latestMs = 0L
     }
 }
 

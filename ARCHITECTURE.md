@@ -138,13 +138,25 @@ every rule is exercised by plain JUnit tests with a fake clock.
 
 | Filter | File | Why |
 | --- | --- | --- |
-| **Kalman** on RSSI | `Filters.kt` | Raw RSSI jitters ±5 dB between two phones lying perfectly still. An average is too laggy to catch a theft; a raw sample is far too noisy to threshold. Tuned so a 20 dB step registers within ~4 samples. |
+| **Kalman** on RSSI | `Filters.kt` | Raw RSSI jitters ±5 dB between two phones lying perfectly still. An average is too laggy to catch a theft; a raw sample is far too noisy to threshold. Process noise is scaled by the **time since the last sample**, so the lag stays around a second whether results arrive every 200 ms or every 5 s. |
 | **Rolling median** baseline | `Filters.kt` | The reference level must survive exactly the events we are detecting. A mean would let a few seconds of occlusion drag the baseline down and blind the detector. |
-| **Least-squares slope** | `Filters.kt` | A passer-by is a symmetric notch — down and straight back up. A theft is a sustained negative slope. |
+| **Least-squares slope** | `Filters.kt` | A passer-by is a symmetric notch — down and straight back up. A theft is a sustained negative slope. Bounded to the last 5 s. |
 
 The baseline only learns while the state is calm **and** both ends report being
 still. Learning during an incident would let the detector talk itself out of a
 real theft.
+
+**Why the filter is told how old its last sample is.** It used to add a fixed
+amount of process noise per update, which quietly assumed a constant sample
+rate. The scanner does nothing of the sort: roughly one result every five
+seconds while calm, several a second once it escalates. At the slow rate that
+filter lagged a receding phone by three to four *seconds*, and every one of
+those seconds went straight onto the detection time, because a lagging estimate
+reaches the drop threshold late. Scaling the noise by elapsed time makes the
+filter open up in proportion to how long it has been flying blind. The same
+reasoning applies to the slope window: bounded by sample count it was 4 s long
+when the radio was busy and nearly 30 s when it was idle, so "the signal is
+still falling" meant two different things depending on the duty cycle.
 
 ### The state machine
 
@@ -166,17 +178,21 @@ rather than sitting unprotected for the full window.
 ### Observer rules — deciding to vote about a peer
 
 ```
-if I am not stationary            → abstain entirely
-if the peer is not armed          → ignore it
-if silent for lostTimeout (10 s)  → vote LOST
-if drop ≥ 11 dB and peer says     → occlusion. Do not vote, and do NOT
-   it is stationary                  escalate the radios
-if drop ≥ 11 dB and peer moving
-   and slope ≤ −0.7 dB/s          → start an episode; vote after 2 s
-                                     (1 s if the drop exceeds 20 dB)
+if I am not stationary             → abstain entirely
+if the peer is not armed           → ignore it
+if silent for lostTimeout (10 s)   → vote LOST
+
+if drop ≥ 11 dB and the peer says  → occlusion. Do not vote, and do NOT
+   it is lying still                  escalate the radios
+
+if drop ≥ 6 dB and peer moving     → start an episode, escalate the radios
+   and slope ≤ −0.7 dB/s
+   in an episode, drop ≥ 11 dB     → vote, once the episode is 2 s old
+                                      (1 s if the drop exceeds 20 dB)
+   in an episode, drop < 4.5 dB    → forget the episode; signal came back
 ```
 
-Three details that matter:
+Four details that matter:
 
 1. **A moving observer abstains.** It cannot tell "you walked away" from "I
    walked away", so it stops voting entirely rather than voting badly.
@@ -186,6 +202,14 @@ Three details that matter:
 3. **The slope test gates the *start* of an episode, not its continuation.** A
    thief who walks twenty metres and then stops produces a flat slope again,
    but the signal never comes back — and that must still count.
+4. **The episode starts well before the vote does.** The confirmation window
+   used to begin only once the signal had already fallen the full 11 dB, so the
+   two costs were paid one after the other: seconds of fading, then seconds of
+   confirming. Starting the episode at 6 dB runs the confirmation *alongside*
+   the fade. Nothing is voted on that would not have been before — the vote
+   still needs the whole drop — and for a step change, which is what occlusion
+   looks like, both clocks still start on the very same sample. It is worth
+   two to three seconds on a phone being walked away with.
 
 ### Consensus — proportional, not a fixed count
 
@@ -231,16 +255,64 @@ detects itself, and this is the path that carries the reaction-time budget:
 Supporting rules:
 
 - The pickup detector only arms once the phone has been left alone for
-  `settleMs` (8 s), so arming while still holding it cannot trip it.
+  `settleMs` (8 s), so arming while still holding it cannot trip it. **This is
+  surfaced in the UI** — the home screen shows "Pickup protection active" or a
+  countdown, because a detector that is silently not armed yet is
+  indistinguishable from one that is broken.
+- **Readiness is latched for the duration of a movement.** See below; this is
+  the difference between a detector that works and one that does not.
+- A lift that never produces a decisive sample still counts once the phone has
+  been **moving continuously for 3 s** — a phone slid off a towel into a bag
+  rather than snatched. The 3 s floor is comfortably longer than the motion
+  monitor's own settling delay, so a knock to the towel cannot reach it.
 - **Corroboration cuts the countdown short**: if the others can already see this
   phone receding, waiting out the grace is pointless.
 - `alarmOnPickupAlone` (default on) decides what happens when the grace expires
   with no corroboration.
 
-The peer path is inherently slower — RSSI has to fall 11 dB and hold, which at
-walking pace takes around five seconds — so in practice the group finds out via
-the victim's own broadcast first. The peer path is the backup for when the
-victim cannot self-report: powered off, in a bag, or already out of range.
+> **Why readiness is latched.** Readiness is derived from "how long has this
+> phone been lying still", and the very first sample that reports movement has
+> to clear that marker. So a lift that *began* gently — below
+> `motionScoreThreshold`, which is a careful hand or a slow slide — disarmed the
+> detector permanently: every stronger sample that followed found a phone that
+> had not been lying still, and did nothing at all. The phone could then be
+> carried away in complete silence, and the only thing the owner ever saw was
+> the app asking them to put it down so it could start guarding again. Whether
+> the detector was ready is now decided **once**, when the movement starts, and
+> held until the phone comes to rest.
+
+The peer path is inherently slower — RSSI has to fall 11 dB and hold — so in
+practice the group finds out via the victim's own broadcast first. The peer path
+is the backup for when the victim cannot self-report: powered off, in a bag, or
+already out of range.
+
+### Measured reaction times
+
+From the in-app simulator, which feeds the engine through its real entry
+points. "Incident" is the moment the phone starts moving.
+
+| Scenario | Before | Now |
+| --- | ---: | ---: |
+| This phone picked up | ~3.5 s | ~3.5 s |
+| Phone carried away, 1.3 m/s | 8.8 s | ~4 s |
+| Phone grabbed and run with | ~5.5 s | ~3 s |
+| Pocketed, then the thief stands still | ~8 s | ~4 s |
+| Speaker unplugged | ~3.5 s | ~3.5 s |
+| Phone switched off | ~10.5 s | ~10.5 s |
+
+Two thirds of that came from the detector (a filter that no longer lags by
+three seconds, and a confirmation window that overlaps the fade), and one third
+from the scenario itself: it used to fade **linearly**, at a rate picked to
+look plausible on a graph. Real path loss is logarithmic — the first two metres
+cost more dB than the next ten — so a linear ramp spends several seconds in a
+shallow slope that never happens in the field. The walk-away scenarios now play
+the log-distance curve for a real walking pace, which is both a harder test in
+the first second and an honest one thereafter.
+
+A phone that is switched off is bounded by `lostTimeout` (10 s) and stays
+there. It is the one case where waiting is the whole point: a peer is only
+"gone" if it has missed several scan windows, and at the calm duty cycle a scan
+result arrives about every five seconds.
 
 ### Handled failure modes
 
@@ -376,6 +448,21 @@ between 700 Hz and 1500 Hz with a little third harmonic, which sits where human
 hearing is most sensitive and cheap speakers are most efficient, and cuts
 through wind and surf far better than a single tone.
 
+### Streaming, not a looped static buffer
+
+The obvious implementation is an `AudioTrack` in `MODE_STATIC` holding two
+seconds of PCM, with `setLoopPoints` doing the repetition. That was the original
+implementation and it was unreliable: the static buffer is ~176 kB, which some
+devices refuse outright, and `setLoopPoints` reports failure through a *return
+code* rather than an exception — so a rejected loop looked like success and
+produced silence.
+
+The failure mode was the worst possible one: the guard believed it was screaming
+while the phone sat there mutely. `MODE_STREAM` with a small buffer and a writer
+thread has none of those limits, runs indefinitely, and reports failure
+honestly. `sirenAudible` says whether audio genuinely started and is surfaced in
+the app, so a mute alarm is visible rather than silent.
+
 ### Routing
 
 Android sends `USAGE_ALARM` to the phone's own loudspeaker — right for every
@@ -441,27 +528,98 @@ heads-up notification and the siren still plays.
 
 ---
 
+## 8b. First run and permissions
+
+`lib/screens/onboarding_screen.dart` · `lib/screens/permissions_screen.dart` ·
+`lib/core/permissions.dart`
+
+### The walkthrough
+
+Four steps, in the order that lets someone actually get protected: **who you
+are → which group → how you prove it is you → what Android needs**.
+
+Completion is **recorded natively**, not inferred. It used to be inferred from
+"does a group exist", which becomes true at step two — so the root widget swapped
+the whole wizard out for the home screen the instant the group was created. The
+user got two steps of a four-step progress bar and never saw the PIN page or the
+permissions walkthrough at all, leaving a guard that could not raise a
+lock-screen prompt and would be suspended by the battery manager within the
+hour. `onboardingComplete` is set at the end of the last step and nowhere else;
+an interrupted first run resumes at the step it stopped on, and installs that
+predate the flag are migrated as already complete.
+
+### The permission list
+
+Android needs six separate grants before the guard works properly, three of
+which are only reachable through its own settings app. The screen is
+deliberately **explain-first**: it lists every permission, what it is for in
+plain language, and specifically *what stops working without it*, before asking
+for anything.
+
+That ordering is not decoration. An app that fires four system dialogs within
+ten seconds of first launch gets refused out of reflex, and on Android a
+permission that has been denied twice can only be restored by digging through
+Settings — so a confusing first run permanently degrades the app.
+
+| Permission | Required | Why |
+| --- | :---: | --- |
+| Bluetooth (scan / advertise / connect) | ● | The entire protocol |
+| Bluetooth switched on | ● | The permission alone is not enough |
+| Notifications | ● | Android only allows background work with an ongoing notification |
+| Ignore battery optimisation | | Otherwise the guard is suspended after 15–30 minutes |
+| Full screen alarms | | Lock-screen disarm prompt (Android 14+) |
+| Camera | | QR joining only; typing the code always works |
+
+The screen re-reads every status on `AppLifecycleState.resumed`, because half of
+them are granted in another app entirely. It is reachable afterwards from
+**Settings ▸ System ▸ Permissions and setup**, and it notes explicitly that no
+internet permission is requested, because the app never uses one.
+
+### The standing reminder
+
+The home screen carries a banner for anything still outstanding, until it is
+dealt with — red when a *required* grant is missing (the guard cannot run at
+all), amber for the optional ones (it runs, but is more easily interrupted). It
+names what is missing and what that specifically costs, and one tap opens the
+walkthrough.
+
+This exists because every one of these failures is **silent**. A phone with no
+notification permission shows an armed shield and guards nothing; a phone whose
+battery exemption was never granted works perfectly for twenty minutes. The list
+itself lives in `core/permissions.dart` and is shared by the walkthrough and the
+banner, because two copies of "what is still missing" is one copy too many.
+Status is re-read whenever the app returns to the foreground — permissions can
+be revoked, and Bluetooth switched off, from outside the app.
+
 ## 9. Testing
 
 ### Automated — `tools\test-all.ps1`
 
-**49 Kotlin/JUnit tests** covering the rules that matter. Every one corresponds
+**58 Kotlin/JUnit tests** covering the rules that matter. Every one corresponds
 to a real situation:
 
 - *Suppression*: person walking between phones; sustained drop from a stationary
-  peer; a moving observer abstaining.
+  peer; a moving observer abstaining; **a knock to the towel is not a pickup**.
 - *Detection*: peer carried away; thief who walks off then stops; single
   observer insufficient with three phones; second observer completing consensus.
 - *Disappearance*: armed peer vanishing; low battery treated as a warning;
   disarmed peers not guarded.
 - *Victim side*: pickup → grace → alarm; **a lift detected by the accelerometer
-  alone starts the countdown** (regression test, see below); a phone still in
-  the owner's hand never trips it; picking it up again before it has settled;
-  disarm cancelling; corroboration cutting the grace short.
-- *Reaction time*: a lifted phone alarms inside the budget; **a shortened grace
-  period really does shorten the wait**.
+  alone starts the countdown** (regression test, see below); **a lift that
+  starts gently still trips it** (regression test); movement that never stops
+  counting as a pickup; a phone still in the owner's hand never trips it;
+  picking it up again before it has settled; disarm cancelling; corroboration
+  cutting the grace short.
+- *Reaction time*: a lifted phone alarms inside the budget; **a peer walking
+  away at 1.3 m/s is caught inside 5 s**, against the log-distance fade rather
+  than a hand-picked ramp; a shortened grace period really does shorten the
+  wait.
 - *Consensus*: the requirement scales with group size; one witness suffices with
   three phones but not with five; a second witness completes it.
+- *Lone phone*: a single phone with no peers at all still alarms when lifted,
+  leaves calibration promptly, and reports when its pickup detector is ready.
+- *Speaker*: a guarded speaker losing its link alarms; one that was never
+  connected does not; pointing at a different speaker clears the latch.
 - *Group control*: relayed alarms; **replayed control packets rejected**;
   sequence wraparound.
 - *Energy*: calm guard stays on the low-power profile; passers-by do not
@@ -471,22 +629,30 @@ to a real situation:
 - *Protocol*: round-trips, tampering, foreign groups, wrong keys, truncation,
   group-code encoding including O/0 confusion, name reassembly.
 
-Plus **8 Dart tests** on snapshot decoding and the consensus mirror — malformed
-payloads, NaN values, unknown enum names from a future native build, and that
-the UI's copy of the consensus rule agrees with Kotlin's.
+Plus **9 Dart tests** on snapshot decoding and the consensus mirror — malformed
+payloads, NaN values, unknown enum names from a future native build, that the
+UI's copy of the consensus rule agrees with Kotlin's, and that an unfinished
+first run is never mistaken for a finished one.
 
 ### In-app simulator — Settings ▸ Testing
 
 Feeds synthetic beacons into **exactly the same engine entry points** the real
 radio uses; nothing is stubbed. Ten scenarios, each declaring whether it must
-alarm or must stay silent, with a pass/fail verdict and the **measured time to
-detection**:
+alarm or must stay silent, with a pass/fail verdict, a **budget**, and the
+**measured time to detection**:
 
 `CALM_GROUP` · `PASSER_BY` · `THEFT_WALK` · `THEFT_RUN` · `POCKETED` ·
 `THEFT_CONSENSUS` · `VANISH` · `VANISH_LOW_BATTERY` · `SELF_PICKUP` ·
 `BOX_TAKEN`
 
 This is what makes the app fully testable **on a single phone**.
+
+**The fades are physics, not curves.** Every walk-away scenario derives its RSSI
+from the same log-distance model the UI uses for proximity — a peer starting
+1.5 m away and moving at 1.3 m/s (or 3.6 m/s for the run). The scripts used to
+fade linearly at a rate chosen to look plausible, which understated the first
+second badly and overstated the tenth; a detector tuned against that is tuned
+against fiction.
 
 **Rehearsals, not real incidents.** A test that sets off the actual siren is
 worse than useless: silencing it disarms the phone, which invalidates every
@@ -515,9 +681,9 @@ connected are skipped automatically.
 
 | Path | What lives there |
 | --- | --- |
-| `lib/core/` | Theme, models, platform-channel client, `GuardController` |
+| `lib/core/` | Theme, models, platform-channel client, `GuardController`, the permission list |
 | `lib/widgets/` | Shield button, peer/box cards, shared chrome |
-| `lib/screens/` | Onboarding, home, group, settings, box setup, simulator, QR scan |
+| `lib/screens/` | Onboarding, permissions, home, group, settings, box setup, simulator, QR scan |
 | `android/.../ble/` | `Protocol`, `BleAdvertiser`, `BleScanner`, `BeaconComposer`, `BleDiscovery` |
 | `android/.../guard/` | `ThreatEngine`, `Filters`, `Models`, `BoxGuard` |
 | `android/.../sensors/` | `MotionMonitor` |
@@ -557,5 +723,7 @@ connected are skipped automatically.
 
 | Version | Change |
 | --- | --- |
-| 1.0.0 | Initial implementation: connectionless BLE mesh, RSSI + accelerometer fusion, multi-observer consensus, peer-loss detection, speaker guarding via A2DP link loss and BLE beacon, native alarm surface with three disarm modes, adaptive radio/sensor energy management, in-app simulator, 43 automated tests. |
+| 1.3.0 | Third field-test round. **(a) A lift that started gently switched the pickup detector off** instead of triggering it: readiness is derived from "how long has this phone been lying still", and the first sample reporting movement clears that marker — so any lift whose opening sample fell below `motionScoreThreshold` left every later, stronger sample looking at a phone that had not been lying still. The phone could be carried off in silence, and all the owner saw was the app asking them to put it down again. Readiness is now decided once, when movement begins, and latched until the phone comes to rest; sustained movement counts even with no decisive sample; and the home screen no longer shows the "put the phone down" chip during the grace period, where it read as the opposite of what the countdown meant. **(b) The peer path was two to three times slower than it needed to be.** The RSSI filter added a fixed amount of process noise per sample, which assumed a constant sample rate and lagged by three to four seconds at the calm scan duty cycle, and the confirmation window only started once the drop was already complete. Process noise now scales with the time since the last sample, the slope window is bounded in time rather than in samples, and an episode starts at 6 dB so confirmation runs alongside the fade — voting still requires the full 11 dB, and a step change behaves exactly as before. A phone carried away at walking pace: 8.8 s → ~4 s. **(c) The first-run walkthrough ended after two of its four steps**, because completion was inferred from "a group exists" — which becomes true at step two — so the PIN page and the entire permissions walkthrough were never shown. Completion is now recorded natively at the end of the last step, an interrupted first run resumes where it stopped, and the home screen carries a standing reminder of anything Android has not allowed yet, since every one of those failures is silent. |
+| 1.2.0 | Second field-test round. **(a) Silent siren**: the alarm used a 176 kB `MODE_STATIC` buffer with `setLoopPoints`, which some devices reject — and `setLoopPoints` signals failure by return code, not exception, so a rejected loop looked like success and played nothing. Rebuilt around `MODE_STREAM` with a writer thread; `sirenAudible` now reports whether audio actually opened, and the UI says so during an alarm. This is why a lone phone detected the lift but never made a sound: rehearsals only play the chirp, so no test ever exercised the siren. **(b) Pickup readiness is now visible** — the detector only arms after the phone has lain still for `settleMs`, and the home screen now shows "Pickup protection active" or a countdown, rather than leaving the user guessing. **(c) Permissions**: a proper explain-then-grant walkthrough replaces the old terse checklist, listing what each permission is for and what breaks without it, re-runnable from Settings. **(d) `BOX_TAKEN` scenario** could never pass without a real paired speaker, and sent a disconnect without a preceding connect; it now borrows a virtual speaker and the engine resets its box-alarm latch when the device changes. Also: the tick loop can no longer be killed by a stray exception, and simulation tidy-up runs even when a scenario ends by itself. |
+| 1.1.0 | Field-test fixes: connectionless BLE mesh, RSSI + accelerometer fusion, multi-observer consensus, peer-loss detection, speaker guarding via A2DP link loss and BLE beacon, native alarm surface with three disarm modes, adaptive radio/sensor energy management, in-app simulator, 43 automated tests. |
 | 1.1.0 | Field-test fixes. **(a) Reaction time**: the accelerometer pickup path was dead code — the handler cleared the "lying still since" marker before the readiness test that reads it, leaving the slow `SIGNIFICANT_MOTION` sensor as the only trigger and taking ~30 s. Fixed, and the armed guard now runs a batched accelerometer instead of waiting on that sensor; detection is ~0.3 s and the default grace period dropped from 10 s to 3 s, with an immediate warning chirp on lift. **(b) Consensus** changed from a fixed observer count to a proportion of the group (default one third), so three phones no longer require two witnesses. **(c) Test scenarios** now run as rehearsals — no real siren, no group broadcast, armed state restored — finish as soon as the verdict is known, and report measured detection times. Several scenarios previously could never pass, because two simulated peers implied a two-witness requirement that only one voter could ever meet. **(d) Lock screen**: a full-screen-intent notification is now posted for the grace period, not only for the alarm, so the disarm prompt appears on a locked phone; the manifest used the non-public `showOnLockScreen` instead of `showWhenLocked`; the home screen warns when Android 14+ withholds the permission, and a lock-screen self-test was added. Also: detector settings extracted into a pure, unit-tested codec with clamping; sliders commit on release rather than on every pixel; `install.ps1` warns when the APK is older than the source. |

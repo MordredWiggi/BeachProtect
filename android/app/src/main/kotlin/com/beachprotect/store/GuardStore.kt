@@ -26,6 +26,15 @@ class GuardStore(context: Context) {
     private val prefs = context.applicationContext
         .getSharedPreferences("beachprotect", Context.MODE_PRIVATE)
 
+    init {
+        // Upgrade path. Installs made before first-run completion was tracked
+        // already have a group and have long since granted their permissions;
+        // sending them back through the wizard would be gratuitous.
+        if (!prefs.contains(KEY_ONBOARDED)) {
+            prefs.edit().putBoolean(KEY_ONBOARDED, hasGroup).apply()
+        }
+    }
+
     // ---- identity --------------------------------------------------------
 
     /** Random per-install id; combined with the group secret to derive a device id. */
@@ -197,6 +206,20 @@ class GuardStore(context: Context) {
         get() = prefs.getBoolean(KEY_SIM, false)
         set(value) = prefs.edit().putBoolean(KEY_SIM, value).apply()
 
+    /**
+     * Whether the first-run walkthrough has been seen all the way through.
+     *
+     * Tracked separately from "has a group", because creating the group is
+     * only step two of four. Keying the first run off the group alone dropped
+     * the user onto the home screen the instant they tapped "Create group",
+     * skipping the PIN and the whole permissions walkthrough - leaving a guard
+     * that could not raise a lock-screen prompt and would be suspended by the
+     * battery manager within the hour.
+     */
+    var onboardingComplete: Boolean
+        get() = prefs.getBoolean(KEY_ONBOARDED, false)
+        set(value) = prefs.edit().putBoolean(KEY_ONBOARDED, value).apply()
+
     /** Calibrated RSSI at one metre, broadcast so peers can estimate distance. */
     var txPowerRef: Int
         get() = prefs.getInt(KEY_TX_POWER_REF, -59)
@@ -306,6 +329,7 @@ class GuardStore(context: Context) {
             "speakReason" to speakReason,
             "armed" to armed,
             "simulationEnabled" to simulationEnabled,
+            "onboardingComplete" to onboardingComplete,
             "txPowerRef" to txPowerRef,
             "boxEnabled" to boxEnabled,
             "boxAddress" to boxAddress,
@@ -332,6 +356,7 @@ class GuardStore(context: Context) {
         (patch["vibrateOnAlarm"] as? Boolean)?.let { vibrateOnAlarm = it }
         (patch["speakReason"] as? Boolean)?.let { speakReason = it }
         (patch["simulationEnabled"] as? Boolean)?.let { simulationEnabled = it }
+        (patch["onboardingComplete"] as? Boolean)?.let { onboardingComplete = it }
         (patch["txPowerRef"] as? Number)?.let { txPowerRef = it.toInt() }
         (patch["boxEnabled"] as? Boolean)?.let { boxEnabled = it }
         // Nullable fields are keyed on presence, not on the value: "forget this
@@ -365,6 +390,7 @@ class GuardStore(context: Context) {
         private const val KEY_SPEAK = "speak"
         private const val KEY_ARMED = "armed"
         private const val KEY_SIM = "sim_enabled"
+        private const val KEY_ONBOARDED = "onboarding_complete"
         private const val KEY_TX_POWER_REF = "tx_power_ref"
         private const val KEY_BOX_ENABLED = "box_enabled"
         private const val KEY_BOX_ADDRESS = "box_address"

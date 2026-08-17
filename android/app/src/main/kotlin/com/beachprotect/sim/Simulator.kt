@@ -6,6 +6,7 @@ import com.beachprotect.guard.AlarmReason
 import com.beachprotect.guard.BoxSignal
 import com.beachprotect.guard.MotionSignal
 import com.beachprotect.guard.ThreatEngine
+import kotlin.math.log10
 import kotlin.math.max
 import kotlin.random.Random
 
@@ -80,27 +81,27 @@ class Simulator(
         ),
         THEFT_WALK(
             "Phone carried away",
-            "A phone starts reporting motion and its signal fades steadily, " +
-                "as if someone picked it up and walked off.",
-            30_000, true, 8_000,
+            "A phone starts reporting motion and walks away at 1.3 m/s, its " +
+                "signal fading exactly as path loss says it should.",
+            30_000, true, 5_000,
         ),
         THEFT_RUN(
             "Phone grabbed and run with",
-            "Same as the walk, but three times faster. Should trip the " +
+            "Same as the walk, but at running pace. Should trip the " +
                 "large-drop fast path.",
-            25_000, true, 5_000,
+            25_000, true, 4_000,
         ),
         POCKETED(
             "Pocketed then stopped",
             "The signal falls hard, then goes flat because the thief stopped " +
                 "moving. The drop must still count.",
-            30_000, true, 8_000,
+            30_000, true, 6_000,
         ),
         THEFT_CONSENSUS(
             "Theft confirmed by a second phone",
             "Three phones. One recedes while another independently votes that " +
                 "it is receding too.",
-            30_000, true, 8_000,
+            30_000, true, 5_000,
         ),
         VANISH(
             "Phone switched off",
@@ -118,12 +119,12 @@ class Simulator(
             "This phone picked up",
             "Simulates the accelerometer noticing this device being lifted " +
                 "after it has settled. Should chirp and alarm within seconds.",
-            35_000, true, 6_000,
+            35_000, true, 5_000,
         ),
         BOX_TAKEN(
             "Speaker unplugged",
             "The guarded speaker's audio link drops.",
-            25_000, true, 6_000,
+            25_000, true, 5_000,
         ),
         ;
 
@@ -177,6 +178,20 @@ class Simulator(
             else -> mutableListOf(
                 VirtualPeer(SIM_PEER_A, -58.0),
                 VirtualPeer(SIM_PEER_B, -66.0),
+            )
+        }
+
+        if (scenario == Scenario.BOX_TAKEN) {
+            // Most people run the tests before they have ever paired a
+            // speaker, and the engine ignores box signals for a speaker it
+            // does not know about - so the scenario would fail for a reason
+            // that has nothing to do with the detector. Lend it a virtual one;
+            // GuardService.stopSimulation() restores the real configuration.
+            engine.configureBox(
+                configured = true,
+                name = "Test speaker",
+                address = SIM_BOX_ADDRESS,
+                guardedHere = true,
             )
         }
     }
@@ -270,10 +285,9 @@ class Simulator(
 
             Scenario.THEFT_WALK -> {
                 if (t < 0) return
-                // ~2.4 dB/s: a person walking away at a normal pace.
                 peers.getOrNull(0)?.let {
                     it.moving = true
-                    it.rssi = max(-98.0, -58.0 - (t / 1000.0) * 2.4)
+                    it.rssi = rssiWalkingAway(t, WALKING_SPEED)
                 }
                 note(scenario, elapsed, "Walking away")
             }
@@ -282,7 +296,7 @@ class Simulator(
                 if (t < 0) return
                 peers.getOrNull(0)?.let {
                     it.moving = true
-                    it.rssi = max(-99.0, -58.0 - (t / 1000.0) * 7.0)
+                    it.rssi = rssiWalkingAway(t, RUNNING_SPEED)
                 }
                 note(scenario, elapsed, "Running away")
             }
@@ -291,11 +305,9 @@ class Simulator(
                 if (t < 0) return
                 peers.getOrNull(0)?.let {
                     it.moving = t < 5_000
-                    it.rssi = if (t < 4_000) {
-                        max(-84.0, -58.0 - (t / 1000.0) * 6.5)
-                    } else {
-                        -84.0
-                    }
+                    // Walks for four seconds, then stands still. The signal
+                    // never comes back, and that must still count.
+                    it.rssi = rssiWalkingAway(minOf(t, 4_000), WALKING_SPEED)
                 }
                 note(scenario, elapsed, if (t < 4_000) "Being pocketed" else "Thief standing still")
             }
@@ -304,7 +316,7 @@ class Simulator(
                 if (t < 0) return
                 peers.getOrNull(0)?.let {
                     it.moving = true
-                    it.rssi = max(-98.0, -58.0 - (t / 1000.0) * 2.4)
+                    it.rssi = rssiWalkingAway(t, WALKING_SPEED)
                 }
                 // The third phone reaches the same conclusion independently.
                 if (t > 3_000) {
@@ -351,7 +363,14 @@ class Simulator(
             }
 
             Scenario.BOX_TAKEN -> {
-                if (t < 0) return
+                // Keep the virtual link alive until the incident, otherwise a
+                // disconnect from an already-disconnected state is a no-op and
+                // the scenario can never fire.
+                if (t < 0) {
+                    engine.onBoxSignal(now, BoxSignal.Connected)
+                    note(scenario, elapsed, "Speaker connected")
+                    return
+                }
                 if (!boxSignalSent) {
                     boxSignalSent = true
                     incidentAt = now
@@ -360,6 +379,22 @@ class Simulator(
                 }
             }
         }
+    }
+
+    /**
+     * RSSI of a peer that started on the towel and has been walking away for
+     * [elapsedMs] at [metresPerSecond].
+     *
+     * The scripts used to fade linearly, at a rate picked to look plausible on
+     * a graph. Real path loss is logarithmic: the first two metres cost more dB
+     * than the next ten. A linear ramp therefore spends several seconds in a
+     * shallow slope that never happens in the field, and made the peer path
+     * look two to three times slower than it actually is - a detector tuned
+     * against it would be tuned against fiction.
+     */
+    private fun rssiWalkingAway(elapsedMs: Long, metresPerSecond: Double): Double {
+        val metres = REST_METRES + metresPerSecond * (elapsedMs / 1000.0)
+        return max(FLOOR_RSSI, REST_RSSI - PATH_LOSS_PER_DECADE * log10(metres / REST_METRES))
     }
 
     private fun note(scenario: Scenario, elapsed: Long, text: String) {
@@ -389,8 +424,24 @@ class Simulator(
         const val SIM_PEER_A = 0xF001
         const val SIM_PEER_B = 0xF002
 
+        /** Stand-in speaker so the box scenario works without real hardware. */
+        const val SIM_BOX_ADDRESS = "F0:00:00:00:BE:EF"
+
         /** Let the engine leave CALIBRATING before anything happens. */
         private const val WARMUP_MS = 6_000L
+
+        /** Where a phone on the same towel sits, and what it reads there. */
+        private const val REST_METRES = 1.5
+        private const val REST_RSSI = -58.0
+
+        /** Never fade below what a real radio can still hear. */
+        private const val FLOOR_RSSI = -98.0
+
+        /** 10 x the path loss exponent, matching `DistanceModel`. Open sand. */
+        private const val PATH_LOSS_PER_DECADE = 25.0
+
+        private const val WALKING_SPEED = 1.3
+        private const val RUNNING_SPEED = 3.6
 
         /** Long enough that the pickup detector has genuinely armed. */
         private const val SELF_PICKUP_DELAY_MS = 10_000L

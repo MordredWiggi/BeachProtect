@@ -155,5 +155,25 @@ void main() {
         );
       }
     });
+
+    /// The first run is only over when the walkthrough says so.
+    ///
+    /// Inferring it from "a group exists" cut the wizard off at step two of
+    /// four - the group is created there - so the PIN and the whole
+    /// permissions walkthrough were never shown at all.
+    test('an unfinished first run is not mistaken for a finished one', () {
+      final midway = GuardSettings.fromMap(<Object?, Object?>{
+        'hasGroup': true,
+        'selfName': 'Jan',
+      });
+      expect(midway.onboardingComplete, isFalse);
+
+      final done = GuardSettings.fromMap(<Object?, Object?>{
+        'hasGroup': true,
+        'selfName': 'Jan',
+        'onboardingComplete': true,
+      });
+      expect(done.onboardingComplete, isTrue);
+    });
   });
 }
