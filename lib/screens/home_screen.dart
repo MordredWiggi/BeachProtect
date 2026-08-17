@@ -761,6 +761,20 @@ class _DiagnosticsStrip extends StatelessWidget {
           label: snapshot.selfStationary ? 'this phone still' : 'this phone moving',
           color: snapshot.selfStationary ? status.armed : status.suspicious,
         ),
+        // Proof that the radio is doing something, not just claiming to. "The
+        // group is empty" has two very different causes - nothing is arriving,
+        // or things arrive and are discarded - and they need different fixes.
+        InfoChip(
+          icon: d.beaconsHeard > 0
+              ? Icons.hearing_rounded
+              : Icons.hearing_disabled_rounded,
+          label: switch ((d.beaconsHeard, d.packetsHeard)) {
+            (0, 0) => 'no beacons heard',
+            (0, _) => '${d.packetsHeard} packets, none in this group',
+            _ => '${d.beaconsHeard} group beacons',
+          },
+          color: d.beaconsHeard > 0 ? status.armed : status.disarmed,
+        ),
         if (!d.hasSignificantMotion)
           InfoChip(
             icon: Icons.battery_alert_rounded,

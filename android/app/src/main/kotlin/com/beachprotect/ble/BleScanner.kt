@@ -38,6 +38,10 @@ import com.beachprotect.guard.RadioProfile
  * The box's BLE address, when known, is added as a *second* hardware filter
  * rather than forcing an unfiltered scan - so tracking the speaker costs
  * essentially nothing extra.
+ *
+ * The filter has to match the shape of what we actually broadcast, which is a
+ * service-data field and nothing else. See [groupBeaconFilter]; getting that
+ * wrong is invisible from one phone and fatal with two.
  */
 class BleScanner(
     private val adapter: BluetoothAdapter?,
@@ -141,11 +145,7 @@ class BleScanner(
         }
 
         val filters = ArrayList<ScanFilter>(2)
-        filters.add(
-            ScanFilter.Builder()
-                .setServiceUuid(BleAdvertiser.SERVICE_PARCEL_UUID)
-                .build(),
-        )
+        filters.add(groupBeaconFilter())
         boxAddress?.let { address ->
             if (BluetoothAdapter.checkBluetoothAddress(address)) {
                 filters.add(ScanFilter.Builder().setDeviceAddress(address).build())
@@ -165,6 +165,38 @@ class BleScanner(
             Log.w(TAG, "bluetooth is off", e)
         }
     }
+
+    /**
+     * The filter that finds group members.
+     *
+     * It matches on **service data**, not on a service UUID, and that
+     * distinction is the whole ballgame. Our beacon is a bare service-data
+     * field (AD type 0x16) carrying the 20 byte payload — there is no
+     * "list of service UUIDs" field in it, because that would cost four more
+     * bytes out of the 31 a legacy advertisement gets and buy nothing.
+     *
+     * `ScanFilter.setServiceUuid` tests `ScanRecord.getServiceUuids()`, which
+     * Android populates *only* from the service-UUID list AD types — never from
+     * service data. So a service-UUID filter cannot match our advertisements at
+     * all: `matchesServiceUuids` sees a null list and returns false for every
+     * single packet. That filter was in place from the first commit, and it
+     * meant no phone ever saw another phone. It is not a subtle degradation —
+     * the mesh simply never formed, on any device, while both radios sat there
+     * doing their jobs perfectly.
+     *
+     * The version byte is used as the pattern so the controller can drop
+     * anything that is not ours before it ever wakes the CPU. Bytes beyond it
+     * (group id, MAC) are deliberately left to the software path: they change
+     * when the user joins a different group, and a filter that goes stale is a
+     * guard that quietly stops seeing anybody.
+     */
+    private fun groupBeaconFilter(): ScanFilter = ScanFilter.Builder()
+        .setServiceData(
+            BleAdvertiser.SERVICE_PARCEL_UUID,
+            byteArrayOf(Protocol.VERSION.toByte()),
+            byteArrayOf(0xFF.toByte()),
+        )
+        .build()
 
     private fun buildSettings(radio: RadioProfile, power: PowerProfile): ScanSettings {
         val builder = ScanSettings.Builder()

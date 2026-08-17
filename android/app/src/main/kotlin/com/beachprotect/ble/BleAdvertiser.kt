@@ -41,10 +41,22 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
     var starting = false
         private set
 
-    /** False when the chipset cannot advertise at all; the UI warns about it. */
+    /**
+     * False when this phone cannot advertise at all, so the UI can say why the
+     * others cannot see it.
+     *
+     * Deliberately *not* `isMultipleAdvertisementSupported`, which is the usual
+     * shorthand and is wrong here: it answers "can several advertising sets run
+     * at once", and we only ever run one. Several otherwise perfectly capable
+     * phones report false for it, and taking it at its word left them silently
+     * invisible to their own group while their radio was ready to go.
+     */
     val supported: Boolean
-        get() = adapter?.isMultipleAdvertisementSupported == true &&
-            adapter.bluetoothLeAdvertiser != null
+        get() = adapter?.bluetoothLeAdvertiser != null
+
+    /** Set when the stack rejected a start outright; surfaced as a warning. */
+    var startRejected = false
+        private set
 
     var running: Boolean = false
         private set
@@ -55,8 +67,10 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
             if (status != ADVERTISE_SUCCESS) {
                 Log.w(TAG, "advertising set failed to start: status=$status")
                 running = false
+                startRejected = true
                 return
             }
+            startRejected = false
             advertisingSet = set
             running = true
             // A payload may have been queued while the set was coming up.

@@ -97,6 +97,22 @@ class GuardService : Service(),
     private var batteryPercent = 100
     private var started = false
 
+    /** Advertisements that got past the hardware filter, ours or not. */
+    private var packetsHeard = 0L
+
+    /** ...and how many of those authenticated as members of this group. */
+    private var beaconsHeard = 0L
+
+    /**
+     * Set when the app was swiped away mid-incident.
+     *
+     * Swiping the app out of Recents stops the guard - but not while it is
+     * actually screaming, because that would hand anyone holding the phone a
+     * one-gesture way to silence it. The shutdown is deferred to the moment the
+     * incident is over instead.
+     */
+    private var stopWhenIdle = false
+
     // =====================================================================
     // Lifecycle
     // =====================================================================
@@ -127,6 +143,18 @@ class GuardService : Service(),
         // Always get into the foreground first: Android gives us only a few
         // seconds after startForegroundService before it kills us.
         startForegroundSafely()
+
+        // A null intent means START_STICKY resurrected us after the process was
+        // killed. That is wanted while the app is still sitting in Recents - a
+        // guard should survive being paged out - but several OEMs kill the
+        // process on a swipe *without* delivering onTaskRemoved, and there the
+        // resurrection would put the notification straight back up for an app
+        // the user has closed. If the task is gone, so are we.
+        if (intent == null && !hasLiveTask()) {
+            Log.i(TAG, "sticky restart with no task; standing down")
+            shutdown()
+            return START_NOT_STICKY
+        }
 
         when (intent?.action) {
             GuardIntents.ACTION_START, null -> ensureStarted()
@@ -229,10 +257,46 @@ class GuardService : Service(),
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * The user swiped BeachProtect out of Recents.
+     *
+     * That is treated as "stop", not as "keep going quietly". The guard used to
+     * outlive the app entirely, which is defensible for a theft alarm but is
+     * not what people expect from a closed app: an ongoing notification for
+     * something with no window anywhere is indistinguishable from an app that
+     * will not go away.
+     *
+     * The one exception is an incident in progress. Silencing a live siren by
+     * swiping a card off the Recents screen would be a gift to whoever is
+     * holding the phone, so the shutdown waits for the alarm to be resolved.
+     *
+     * Requires `android:stopWithTask="false"` in the manifest: with `true` the
+     * system kills the service outright and this is never called, so there
+     * would be nowhere to make that distinction - or to shut the radios, the
+     * wake lock and the heartbeat alarm down in an orderly way.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(TAG, "task removed; state=${engine.state}")
+        if (engine.state == GuardState.ALARM || engine.state == GuardState.PENDING) {
+            stopWhenIdle = true
+        } else {
+            shutdown()
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         shutdown()
         super.onDestroy()
     }
+
+    /** Whether BeachProtect still has a task of its own in Recents. */
+    private fun hasLiveTask(): Boolean = runCatching {
+        val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        manager.appTasks.isNotEmpty()
+        // Optimistic on failure: a guard that stops because a system call threw
+        // is worse than a notification that lingers.
+    }.getOrDefault(true)
 
     private fun ensureStarted() {
         if (started) return
@@ -249,6 +313,7 @@ class GuardService : Service(),
 
     private fun shutdown() {
         started = false
+        stopWhenIdle = false
         handler.removeCallbacksAndMessages(null)
         tickScheduled = false
         cancelHeartbeat()
@@ -261,7 +326,16 @@ class GuardService : Service(),
         releaseWakeLock()
         runCatching { unregisterReceiver(systemReceiver) }
         instance = null
+        snapshotListener = null
         stopForegroundCompat()
+        // Belt and braces. STOP_FOREGROUND_REMOVE takes the ongoing one away,
+        // but an alarm notification posted on the high-importance channel is a
+        // separate one and would otherwise sit there after the app is gone -
+        // which is the exact thing that makes a closed app feel not closed.
+        runCatching {
+            notificationManager().cancel(NOTIFICATION_ID_GUARD)
+            notificationManager().cancel(NOTIFICATION_ID_ALARM)
+        }
         stopSelf()
     }
 
@@ -340,7 +414,13 @@ class GuardService : Service(),
             return
         }
         engine.setExternalWarning(GuardWarning.BLUETOOTH_OFF, false)
-        engine.setExternalWarning(GuardWarning.ADVERTISING_UNAVAILABLE, !advertiser.supported)
+        // Either the chipset cannot advertise, or it accepted the request and
+        // then rejected it. Both mean the same thing to the user: the rest of
+        // the group cannot see this phone.
+        engine.setExternalWarning(
+            GuardWarning.ADVERTISING_UNAVAILABLE,
+            !advertiser.supported || advertiser.startRejected,
+        )
 
         scanner.apply(radioProfile, store.powerProfile, store.boxBleAddress.takeIf { store.boxEnabled })
         advertiser.start(radioProfile, composeBeacon())
@@ -475,6 +555,16 @@ class GuardService : Service(),
 
             else -> Unit
         }
+
+        // The app was swiped away during an incident and the incident is now
+        // over. Posted rather than called inline: we are several frames deep
+        // inside the engine, and tearing the service down underneath it would
+        // re-enter the very code that is still running.
+        if (stopWhenIdle && current != GuardState.ALARM && current != GuardState.PENDING) {
+            handler.post { if (stopWhenIdle) shutdown() }
+            return
+        }
+
         scheduleTick(immediate = true)
         updateNotification(now(), force = true)
     }
@@ -561,7 +651,13 @@ class GuardService : Service(),
     // =====================================================================
 
     override fun onServiceData(rssi: Int, payload: ByteArray, elapsedNanos: Long) {
+        // Counted before anything can reject it. "The radios are on but nobody
+        // appears" has two completely different causes - nothing arriving at
+        // all, or arriving and being thrown away - and from the outside they
+        // look identical. Both numbers are surfaced in the app.
+        packetsHeard++
         val beacon = Protocol.decode(payload, store.groupId, store.groupKey) ?: return
+        beaconsHeard++
         engine.onPeerBeacon(now(), rssi, beacon)
         // Scan results are what keeps the loop alive while the CPU would
         // otherwise be asleep, so opportunistically drive a tick from here.
@@ -986,6 +1082,8 @@ class GuardService : Service(),
         "powerProfile" to store.powerProfile.name,
         "wakeLockHeld" to (wakeLock?.isHeld == true),
         "serviceRunning" to started,
+        "packetsHeard" to packetsHeard,
+        "beaconsHeard" to beaconsHeard,
         "sirenAudible" to alarmPlayer.sirenAudible,
         "simulationRunning" to simulator.running,
         "simulationScenario" to simulator.activeScenario?.name,

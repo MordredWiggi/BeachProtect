@@ -47,6 +47,9 @@ single cross-check removes the entire class of false alarms.
   that works over the lock screen.
 - **Runs all afternoon.** No continuous sensors while calm, hardware-filtered
   low-duty scanning, no permanent wake lock.
+- **Stops when you close it.** The guard runs while the app does — backgrounded,
+  screen off, in a pocket — and shuts down completely, notification and all,
+  when you swipe the app away.
 
 ## Getting started
 
@@ -113,6 +116,8 @@ snapshot decoding:
 ## Honest limitations
 
 - Every phone must have the app installed and be in the same group.
+- The app has to stay open. Backgrounded is fine; swiped out of Recents stops
+  the guard, and it does not come back by itself after a reboot.
 - Distance is approximate; the UI shows coarse buckets rather than fake metres.
 - An idle speaker takes a few seconds longer to notice than one playing music.
 - Aggressive OEM battery managers can still kill background services — grant

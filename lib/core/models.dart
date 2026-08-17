@@ -264,6 +264,8 @@ class Diagnostics {
     required this.powerProfile,
     required this.wakeLockHeld,
     required this.serviceRunning,
+    required this.packetsHeard,
+    required this.beaconsHeard,
     required this.sirenAudible,
     required this.simulationRunning,
     required this.simulationScenario,
@@ -283,6 +285,16 @@ class Diagnostics {
   final String powerProfile;
   final bool wakeLockHeld;
   final bool serviceRunning;
+
+  /// Advertisements that got past the hardware scan filter, ours or not.
+  ///
+  /// Zero while scanning means the radio is hearing nothing at all; a healthy
+  /// number here with [beaconsHeard] at zero means packets are arriving and
+  /// being rejected — a different group, or a different build.
+  final int packetsHeard;
+
+  /// ...and how many of those authenticated as members of this group.
+  final int beaconsHeard;
 
   /// Whether the siren genuinely opened an audio output. False during an alarm
   /// means the phone believes it is screaming while sitting there mutely.
@@ -307,6 +319,8 @@ class Diagnostics {
     powerProfile: 'BALANCED',
     wakeLockHeld: false,
     serviceRunning: false,
+    packetsHeard: 0,
+    beaconsHeard: 0,
     sirenAudible: false,
     simulationRunning: false,
     simulationScenario: null,
@@ -341,6 +355,8 @@ class Diagnostics {
       powerProfile: map['powerProfile'] as String? ?? 'BALANCED',
       wakeLockHeld: map['wakeLockHeld'] as bool? ?? false,
       serviceRunning: map['serviceRunning'] as bool? ?? false,
+      packetsHeard: (map['packetsHeard'] as num?)?.toInt() ?? 0,
+      beaconsHeard: (map['beaconsHeard'] as num?)?.toInt() ?? 0,
       sirenAudible: map['sirenAudible'] as bool? ?? false,
       simulationRunning: map['simulationRunning'] as bool? ?? false,
       simulationScenario: map['simulationScenario'] as String?,

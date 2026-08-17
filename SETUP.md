@@ -339,6 +339,12 @@ walk away with one while still collecting logs.
    its 16-character code.
 3. Use the **same group PIN** everywhere — that is what lets any of you silence
    a false alarm on anyone's phone.
+4. Leave the app open on every phone. Backgrounded and screen off is fine;
+   swiped out of Recents stops that phone's guard entirely.
+
+Within about ten seconds each phone should list the others under **Group**, and
+the `group beacons` chip at the bottom of the home screen should be counting up.
+Neither phone has to be armed for that.
 
 ---
 
@@ -376,9 +382,10 @@ of the app without uninstalling it first.
 | `INSTALL_FAILED_USER_RESTRICTED` (Xiaomi) | Developer options ▸ turn on **Install via USB**. |
 | Build fails after editing Kotlin | `.\tools\build-apk.ps1 -Clean` |
 | Gradle daemon stuck | `cd android; .\gradlew.bat --stop` |
-| Phones cannot see each other | Both must be in the *same group*, both armed, Bluetooth on. Give it ~10 s: the calm scan only listens for about half a second in every five. |
-| No peers ever appear | Check the home screen's diagnostics chips: `broadcasting` must be lit. If it says `silent`, the chipset may not support BLE peripheral mode — the app warns about this explicitly. |
+| Phones cannot see each other | Both must be in the *same group* with the app open, and Bluetooth on. Give it ~10 s: the calm scan only listens for about half a second in every five. Arming is *not* required to appear in each other's group list. |
+| No peers ever appear | Read the home screen's diagnostics chips in order. `broadcasting` unlit means this phone is invisible to the others — usually a chipset without BLE peripheral mode, which the app warns about. `no beacons heard` means nothing is arriving at all. `N packets, none in this group` means packets are arriving and being rejected: the two phones are in different groups, or running different builds. |
 | Guard dies after a while | Grant the battery-optimisation exemption in onboarding. On Xiaomi/Huawei/Samsung also allow "background activity" / "auto-start" in the manufacturer's own battery settings. |
+| Guard stops when I close the app | Working as intended since 1.4.0 — the guard runs while the app does. Leave BeachProtect open (backgrounded and screen off is fine) while it is guarding. |
 | Alarm screen does not cover the lock screen | Android 14+: **Settings ▸ Full screen alarm permission** inside the app. |
 
 ---

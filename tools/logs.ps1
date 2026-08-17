@@ -40,6 +40,6 @@ if ($All) {
 else {
     & adb @deviceArgs logcat -s `
         BpGuardService:V BpScanner:V BpAdvertiser:V BpMotion:V `
-        BpBoxGuard:V BpAlarmPlayer:V BpDiscovery:V BpBootReceiver:V `
+        BpBoxGuard:V BpAlarmPlayer:V BpDiscovery:V `
         flutter:V AndroidRuntime:E
 }

@@ -55,11 +55,17 @@ phone in the group. And because one flaky radio should never start a siren,
 ```
 
 **Why the guard is native Kotlin, not Dart.** It has to keep working for hours
-with the screen off and the app swiped away. A background Dart isolate would
-keep a Flutter engine alive the whole time, and could not reach the APIs that
-make this cheap — hardware-offloaded scan filters, sensor FIFO batching, and
-the significant-motion wake-up sensor. The Flutter engine is a *window* onto
-the service; it can be destroyed at any moment without the guard noticing.
+with the screen off, the phone in a pocket and the UI long since discarded to
+save memory. A background Dart isolate would keep a Flutter engine alive the
+whole time, and could not reach the APIs that make this cheap —
+hardware-offloaded scan filters, sensor FIFO batching, and the
+significant-motion wake-up sensor. The Flutter engine is a *window* onto the
+service; it can be destroyed at any moment without the guard noticing.
+
+**How long it lives.** For exactly as long as the app does — see §6b. The
+guard is a foreground service, so the screen going off, the app going to the
+background, and Android reclaiming the Flutter engine all leave it running.
+Swiping the app out of Recents stops it.
 
 **One source of truth.** All configuration and all guard state live natively
 (`GuardStore`, `ThreatEngine`). The UI reads them over the channel and writes
@@ -365,9 +371,10 @@ even while disarmed. The home screen shows a warning chip when this happens.
 
 `ble/BleScanner.kt` — every scan is:
 
-1. **Filtered in hardware.** A `ScanFilter` on our service UUID is pushed into
-   the Bluetooth controller, so the CPU is never woken for the hundreds of
-   unrelated advertisements on a busy beach.
+1. **Filtered in hardware.** A `ScanFilter` on our **service data** is pushed
+   into the Bluetooth controller, so the CPU is never woken for the hundreds of
+   unrelated advertisements on a busy beach. Filtering is not optional, either:
+   Android 8.1 and up simply ignores an unfiltered scan while the screen is off.
 2. **At the lowest duty cycle that works.** `SCAN_MODE_LOW_POWER` is roughly a
    512 ms window every 5.12 s. It escalates to `SCAN_MODE_LOW_LATENCY` only
    when the engine has real evidence to chase, and drops straight back.
@@ -377,6 +384,25 @@ even while disarmed. The home screen shows a warning chip when this happens.
 
 The speaker's BLE address is added as a **second hardware filter** rather than
 forcing an unfiltered scan, so tracking it costs essentially nothing.
+
+> **The filter has to match the shape of the advertisement, not just its UUID.**
+> Our beacon is a bare service-data field (AD type `0x16`) carrying the 20
+> bytes; there is no "list of service UUIDs" field in it, because that would
+> cost four more of the 31 bytes a legacy advertisement gets and buy nothing.
+> `ScanFilter.setServiceUuid` tests `ScanRecord.getServiceUuids()`, which
+> Android populates *only* from the service-UUID list types — never from service
+> data. A service-UUID filter therefore matched **no packet at all**, on any
+> device, and the software filter in `GattService` applies regardless of what
+> the controller offloads, so there was no version of this that happened to
+> work. Both radios ran perfectly and no phone ever saw another phone. The
+> filter now matches on service data, with the version byte as its pattern so
+> the controller can still reject foreign traffic before waking the CPU.
+
+**Two numbers on the home screen exist because of that bug.** "Packets heard"
+counts everything that got past the filter; "group beacons" counts those that
+authenticated as ours. Nothing arriving at all and things arriving but being
+discarded are completely different faults, and from the outside — an empty
+group list — they look identical.
 
 ### Advertising
 
@@ -388,6 +414,14 @@ the cheapest thing BLE offers.
 something looks wrong, but observers detect theft by comparing RSSI against a
 learned baseline, so raising TX power mid-incident would lift every reading and
 mask exactly the drop we are trying to catch.
+
+**"Can this phone advertise" is not `isMultipleAdvertisementSupported`.** That
+is the usual shorthand for the question and it answers a different one — whether
+several advertising sets can run at once — and we only ever run one. Several
+otherwise capable phones report false for it, and believing them left those
+phones silently invisible to their own group. The test is now simply whether the
+platform hands us an advertiser, and a start that the stack *rejects* raises the
+same "the others cannot see you" warning as no support at all.
 
 ### CPU
 
@@ -409,6 +443,56 @@ the air completely silent. Inexact on purpose — an exact alarm would require
 | Maximum | `BALANCED` (~25 % duty) | Reacts hardest, only setting that noticeably shortens the day |
 | **Balanced** (default) | `LOW_POWER` (~10 % duty) | Escalates on evidence |
 | Saver | `LOW_POWER` + hardware batching | CPU sleeps longer; costs a second or two of reaction |
+
+---
+
+## 6b. Lifetime — when the guard runs, and when it stops
+
+`service/GuardService.kt`
+
+**The guard lives exactly as long as the app does.** Not longer.
+
+| Event | Guard | Notification |
+| --- | --- | --- |
+| Screen off, phone in a pocket | runs | stays |
+| App backgrounded, Flutter engine reclaimed | runs | stays |
+| App swiped out of Recents | **stops** | **gone** |
+| Process killed under memory pressure, task still in Recents | restarts | stays |
+| Phone rebooted | does not come back | none |
+
+This is a deliberate reversal. A theft alarm that outlives its app is
+defensible on paper, and the service used to do exactly that — but an ongoing
+notification for something with no window anywhere is indistinguishable from an
+app that will not go away, and "I closed it and it is still there" is not a
+trade anyone agreed to. Closing the app closes the app.
+
+Three details make that hold in practice:
+
+- **`onTaskRemoved`, not `stopWithTask="true"`.** The manifest flag makes the
+  system kill the service outright, with no callback and no chance to shut the
+  radios, the wake lock and the heartbeat alarm down in order. Keeping it
+  `false` and handling `onTaskRemoved` gives an orderly stop — and somewhere to
+  make the one exception below.
+- **An alarm in progress is not interrupted.** Silencing a live siren by
+  flicking a card off the Recents screen would be a gift to whoever is holding
+  the phone. The shutdown is deferred until the incident is resolved, and then
+  happens by itself.
+- **A sticky restart with no task stands down.** Several OEMs kill the process
+  on a swipe *without* delivering `onTaskRemoved`, and `START_STICKY` would then
+  put the notification straight back up for an app the user has closed. On a
+  restart with a null intent the service checks whether the app still has a task
+  in Recents, and stops if it does not. It still recovers normally from a
+  genuine memory-pressure kill, which is what stickiness is for.
+
+**No boot receiver.** The guard used to restore itself after a reboot if it had
+been armed. It no longer does, for the same reason: nobody opened the app, so
+nothing should be running. The armed flag is still persisted, so opening the app
+picks the guard straight back up where it was.
+
+The cost is stated plainly rather than hidden: **swiping the app away while it
+is guarding stops guarding.** The home screen and the ongoing notification are
+the only places the guard's state is visible, so if the notification is gone,
+nothing is being watched.
 
 ---
 
@@ -688,7 +772,7 @@ connected are skipped automatically.
 | `android/.../guard/` | `ThreatEngine`, `Filters`, `Models`, `BoxGuard` |
 | `android/.../sensors/` | `MotionMonitor` |
 | `android/.../alarm/` | `AlarmPlayer` |
-| `android/.../service/` | `GuardService`, `GuardIntents`, `BootReceiver` |
+| `android/.../service/` | `GuardService`, `GuardIntents` |
 | `android/.../ui/` | `AlarmActivity` |
 | `android/.../sim/` | `Simulator` |
 | `android/.../store/` | `GuardStore` |
@@ -702,6 +786,8 @@ connected are skipped automatically.
 
 - **Both phones must have BeachProtect installed and be in the same group.**
   There is no way to guard a phone that is not running the app.
+- **The app has to stay open** — backgrounded is fine, swiped away is not, and
+  the guard does not return by itself after a reboot (§6b).
 - **BLE peripheral mode is required** to be *watched* by others. Almost every
   phone since Android 5 supports it, but a handful of budget chipsets do not;
   the app detects this and warns, and such a phone can still watch others.
@@ -723,6 +809,7 @@ connected are skipped automatically.
 
 | Version | Change |
 | --- | --- |
+| 1.4.0 | Two-phone field test. **(a) No phone had ever seen another phone.** The scanner filtered on a *service UUID*, while the beacon carries its payload as *service data* and nothing else. `ScanRecord.getServiceUuids()` is populated only from the service-UUID list AD types, never from service data, and the framework applies that filter in software regardless of what the controller offloads — so the filter matched no packet at all, on every device, since the first commit. Both radios worked perfectly and the mesh simply never formed; with one phone there is nothing to notice. The filter now matches service data, keyed on the version byte so foreign traffic is still rejected in hardware. Two counters — packets heard, and how many of those authenticated as this group — are now on the home screen, because "nothing is arriving" and "things arrive and are discarded" are different faults that look identical from an empty group list. The capability check for advertising was also over-strict: it used `isMultipleAdvertisementSupported`, which answers whether *several* sets can run at once, so phones that can advertise perfectly well were refusing to. **(b) The guard now stops when the app is closed.** It used to outlive the app deliberately; an ongoing notification for an app with no window is indistinguishable from one that will not go away. Swiping BeachProtect out of Recents shuts the radios, the wake lock, the heartbeat and both notifications down in order, a sticky restart with no task in Recents stands down rather than reposting the notification, and the boot receiver is gone. An alarm already sounding is the one exception: it finishes first, so a siren cannot be silenced by flicking a card off the Recents screen. |
 | 1.3.0 | Third field-test round. **(a) A lift that started gently switched the pickup detector off** instead of triggering it: readiness is derived from "how long has this phone been lying still", and the first sample reporting movement clears that marker — so any lift whose opening sample fell below `motionScoreThreshold` left every later, stronger sample looking at a phone that had not been lying still. The phone could be carried off in silence, and all the owner saw was the app asking them to put it down again. Readiness is now decided once, when movement begins, and latched until the phone comes to rest; sustained movement counts even with no decisive sample; and the home screen no longer shows the "put the phone down" chip during the grace period, where it read as the opposite of what the countdown meant. **(b) The peer path was two to three times slower than it needed to be.** The RSSI filter added a fixed amount of process noise per sample, which assumed a constant sample rate and lagged by three to four seconds at the calm scan duty cycle, and the confirmation window only started once the drop was already complete. Process noise now scales with the time since the last sample, the slope window is bounded in time rather than in samples, and an episode starts at 6 dB so confirmation runs alongside the fade — voting still requires the full 11 dB, and a step change behaves exactly as before. A phone carried away at walking pace: 8.8 s → ~4 s. **(c) The first-run walkthrough ended after two of its four steps**, because completion was inferred from "a group exists" — which becomes true at step two — so the PIN page and the entire permissions walkthrough were never shown. Completion is now recorded natively at the end of the last step, an interrupted first run resumes where it stopped, and the home screen carries a standing reminder of anything Android has not allowed yet, since every one of those failures is silent. |
 | 1.2.0 | Second field-test round. **(a) Silent siren**: the alarm used a 176 kB `MODE_STATIC` buffer with `setLoopPoints`, which some devices reject — and `setLoopPoints` signals failure by return code, not exception, so a rejected loop looked like success and played nothing. Rebuilt around `MODE_STREAM` with a writer thread; `sirenAudible` now reports whether audio actually opened, and the UI says so during an alarm. This is why a lone phone detected the lift but never made a sound: rehearsals only play the chirp, so no test ever exercised the siren. **(b) Pickup readiness is now visible** — the detector only arms after the phone has lain still for `settleMs`, and the home screen now shows "Pickup protection active" or a countdown, rather than leaving the user guessing. **(c) Permissions**: a proper explain-then-grant walkthrough replaces the old terse checklist, listing what each permission is for and what breaks without it, re-runnable from Settings. **(d) `BOX_TAKEN` scenario** could never pass without a real paired speaker, and sent a disconnect without a preceding connect; it now borrows a virtual speaker and the engine resets its box-alarm latch when the device changes. Also: the tick loop can no longer be killed by a stray exception, and simulation tidy-up runs even when a scenario ends by itself. |
 | 1.1.0 | Field-test fixes: connectionless BLE mesh, RSSI + accelerometer fusion, multi-observer consensus, peer-loss detection, speaker guarding via A2DP link loss and BLE beacon, native alarm surface with three disarm modes, adaptive radio/sensor energy management, in-app simulator, 43 automated tests. |

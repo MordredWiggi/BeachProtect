@@ -29,8 +29,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- No RECEIVE_BOOT_COMPLETED: the guard deliberately does not come back by
+         itself after a reboot. It runs while the app does, and a notification
+         for an app nobody opened is exactly what this app should not do. -->
 
     <!-- ===================== Alarm output ===================== -->
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -91,23 +93,19 @@
             android:theme="@style/AlarmTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
 
-        <!-- The always-on guard. stopWithTask=false keeps guarding after the user
-             swipes the app away from Recents. -->
+        <!-- The guard runs for as long as the app does, and stops when the user
+             swipes it out of Recents.
+
+             stopWithTask stays false on purpose, and does NOT mean "keep going":
+             with true the system kills the service outright, whereas false
+             delivers Service.onTaskRemoved, where GuardService shuts the radios,
+             the wake lock and the heartbeat alarm down in order - and can keep
+             going for the one case that matters, an alarm already sounding. -->
         <service
             android:name=".service.GuardService"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="connectedDevice" />
-
-        <receiver
-            android:name=".service.BootReceiver"
-            android:exported="true"
-            android:enabled="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
-            </intent-filter>
-        </receiver>
 
         <meta-data
             android:name="flutterEmbedding"
