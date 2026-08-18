@@ -145,6 +145,8 @@ class PeerInfo {
     required this.boxGuardian,
     required this.simulated,
     required this.lastSeenMsAgo,
+    required this.linkStale,
+    required this.staleAfterMs,
     required this.suspected,
     required this.votesAgainst,
     required this.votesRequired,
@@ -166,6 +168,18 @@ class PeerInfo {
   final bool boxGuardian;
   final bool simulated;
   final int lastSeenMsAgo;
+
+  /// Whether this peer has been silent for longer than is normal at the scan
+  /// duty cycle currently in use — so nothing else on this record is current.
+  ///
+  /// Decided natively, where the arrival times are known. The UI used to apply
+  /// its own flat eight second rule, which at the calm profile is shorter than
+  /// an ordinary gap between two scan results: a phone on the same towel
+  /// flickered between "still, watched" and "no signal" once a second.
+  final bool linkStale;
+
+  /// The threshold behind [linkStale].
+  final int staleAfterMs;
   final bool suspected;
   final int votesAgainst;
   final int votesRequired;
@@ -175,7 +189,7 @@ class PeerInfo {
           ? name!.trim()
           : 'Phone ${deviceId.toRadixString(16).toUpperCase().padLeft(4, '0')}';
 
-  bool get stale => lastSeenMsAgo > 8000;
+  bool get stale => linkStale;
 
   static PeerInfo fromMap(Map<Object?, Object?> map) => PeerInfo(
         deviceId: (map['deviceId'] as num?)?.toInt() ?? 0,
@@ -195,6 +209,8 @@ class PeerInfo {
         boxGuardian: map['boxGuardian'] as bool? ?? false,
         simulated: map['simulated'] as bool? ?? false,
         lastSeenMsAgo: (map['lastSeenMsAgo'] as num?)?.toInt() ?? 0,
+        linkStale: map['linkStale'] as bool? ?? false,
+        staleAfterMs: (map['staleAfterMs'] as num?)?.toInt() ?? 12000,
         suspected: map['suspected'] as bool? ?? false,
         votesAgainst: (map['votesAgainst'] as num?)?.toInt() ?? 0,
         votesRequired: (map['votesRequired'] as num?)?.toInt() ?? 1,
@@ -384,6 +400,7 @@ class GuardSnapshot {
     required this.alarmReason,
     required this.alarmSubjectId,
     required this.alarmSubjectName,
+    required this.groupAlarmActive,
     required this.peers,
     required this.box,
     required this.warnings,
@@ -406,6 +423,15 @@ class GuardSnapshot {
   final AlarmReason? alarmReason;
   final int alarmSubjectId;
   final String? alarmSubjectName;
+
+  /// Whether *the group* is in an incident, which is not the same question as
+  /// whether this phone is.
+  ///
+  /// The alarm controls used to be gated on the local state, so the instant
+  /// somebody silenced their own handset the buttons that could reach everyone
+  /// else disappeared — replaced, absurdly, by "Arm all" — while the rest of the
+  /// group carried on screaming.
+  final bool groupAlarmActive;
   final List<PeerInfo> peers;
   final BoxInfo box;
   final Set<GuardWarning> warnings;
@@ -424,13 +450,23 @@ class GuardSnapshot {
     alarmReason: null,
     alarmSubjectId: 0,
     alarmSubjectName: null,
+    groupAlarmActive: false,
     peers: <PeerInfo>[],
     box: BoxInfo.empty,
     warnings: <GuardWarning>{},
     diagnostics: Diagnostics.empty,
   );
 
-  int get armedPeerCount => peers.where((p) => p.armed).length;
+  /// Peers we can currently *see* guarding. A phone whose last beacon said
+  /// "armed" twenty seconds ago is not evidence of anything.
+  int get armedPeerCount => peers.where((p) => p.armed && !p.linkStale).length;
+
+  /// Whether anything in the group is being watched, this phone included.
+  ///
+  /// What "Arm all" / "Disarm all" should offer depends on the group, not on
+  /// this handset: a phone that has stood itself down is still the one holding
+  /// the button that stands everybody else down.
+  bool get anyoneGuarding => state.isProtecting || armedPeerCount > 0;
 
   static GuardSnapshot fromMap(Map<Object?, Object?> map) {
     final peerList = (map['peers'] as List?)
@@ -465,6 +501,7 @@ class GuardSnapshot {
               AlarmReason.theftConsensus),
       alarmSubjectId: (map['alarmSubjectId'] as num?)?.toInt() ?? 0,
       alarmSubjectName: map['alarmSubjectName'] as String?,
+      groupAlarmActive: map['groupAlarmActive'] as bool? ?? false,
       peers: peerList,
       box: BoxInfo.fromMap(map['box'] as Map<Object?, Object?>?),
       warnings: warnings,
@@ -519,14 +556,18 @@ extension PowerProfileX on PowerProfile {
 
   String get detail => switch (this) {
         PowerProfile.maxProtection =>
-          'Scans at a high duty cycle the whole time. Reacts fastest, and is '
-              'the only setting that will noticeably shorten your day.',
+          'Listens continuously. Reacts fastest, sees every phone in the group '
+              'update several times a second, and is the only setting that will '
+              'noticeably shorten your day.',
         PowerProfile.balanced =>
-          'Slow patrol that speeds up the instant anything looks wrong. This '
-              'is the right choice for almost everyone.',
+          'Listens about a quarter of the time and goes flat out the instant '
+              'anything looks wrong. This is the right choice for almost '
+              'everyone.',
         PowerProfile.ultraSaver =>
-          'Adds hardware scan batching where the chipset supports it, letting '
-              'the processor sleep longer. Costs a second or two of reaction time.',
+          'Listens about a tenth of the time, with hardware scan batching where '
+              'the chipset supports it. Cheapest by a good margin, but the group '
+              'list updates every few seconds rather than continuously, and '
+              '"arm all" can take a few seconds to reach everybody.',
       };
 }
 

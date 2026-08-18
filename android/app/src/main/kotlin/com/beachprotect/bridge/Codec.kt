@@ -13,9 +13,15 @@ import com.beachprotect.guard.Proximity
  */
 object Codec {
 
+    /**
+     * @param localNames nicknames the user typed, which always win.
+     * @param learnedNames names peers broadcast about themselves, persisted so a
+     *        peer that has gone quiet does not fall back to a hexadecimal id.
+     */
     fun snapshot(
         snapshot: GuardSnapshot,
         localNames: Map<Int, String>,
+        learnedNames: Map<Int, String> = emptyMap(),
         diagnostics: Map<String, Any?>,
     ): Map<String, Any?> = mapOf(
         "state" to snapshot.state.name,
@@ -29,8 +35,9 @@ object Codec {
         "pendingRemainingMs" to snapshot.pendingRemainingMs,
         "alarmReason" to snapshot.alarmReason?.name,
         "alarmSubjectId" to snapshot.alarmSubjectId,
-        "alarmSubjectName" to nameFor(snapshot, localNames, snapshot.alarmSubjectId),
-        "peers" to snapshot.peers.map { peer(it, localNames) },
+        "alarmSubjectName" to nameFor(snapshot, localNames, learnedNames, snapshot.alarmSubjectId),
+        "groupAlarmActive" to snapshot.groupAlarmActive,
+        "peers" to snapshot.peers.map { peer(it, localNames, learnedNames) },
         "box" to mapOf(
             "configured" to snapshot.box.configured,
             "name" to snapshot.box.name,
@@ -45,9 +52,13 @@ object Codec {
         "diagnostics" to diagnostics,
     )
 
-    private fun peer(peer: PeerSnapshot, localNames: Map<Int, String>): Map<String, Any?> = mapOf(
+    private fun peer(
+        peer: PeerSnapshot,
+        localNames: Map<Int, String>,
+        learnedNames: Map<Int, String>,
+    ): Map<String, Any?> = mapOf(
         "deviceId" to peer.deviceId,
-        "name" to (localNames[peer.deviceId] ?: peer.name),
+        "name" to (localNames[peer.deviceId] ?: peer.name ?: learnedNames[peer.deviceId]),
         "broadcastName" to peer.name,
         "rssi" to clean(peer.rssi),
         "baseline" to clean(peer.baseline),
@@ -63,6 +74,8 @@ object Codec {
         "boxGuardian" to peer.boxGuardian,
         "simulated" to peer.simulated,
         "lastSeenMsAgo" to peer.lastSeenMsAgo,
+        "linkStale" to peer.linkStale,
+        "staleAfterMs" to peer.staleAfterMs,
         "suspected" to peer.suspected,
         "votesAgainst" to peer.votesAgainst,
         "votesRequired" to peer.votesRequired,
@@ -71,11 +84,13 @@ object Codec {
     private fun nameFor(
         snapshot: GuardSnapshot,
         localNames: Map<Int, String>,
+        learnedNames: Map<Int, String>,
         deviceId: Int,
     ): String? {
         if (deviceId == snapshot.selfDeviceId) return snapshot.selfName.ifEmpty { "This phone" }
         localNames[deviceId]?.let { return it }
-        return snapshot.peers.firstOrNull { it.deviceId == deviceId }?.name
+        snapshot.peers.firstOrNull { it.deviceId == deviceId }?.name?.let { return it }
+        return learnedNames[deviceId]
     }
 
     /** NaN and infinities become null so the Dart side can pattern match on it. */

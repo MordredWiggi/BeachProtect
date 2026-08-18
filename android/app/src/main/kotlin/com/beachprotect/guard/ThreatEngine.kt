@@ -119,6 +119,15 @@ class ThreatEngine(
         private set
 
     /**
+     * Which device put the alarm currently sounding here on the air.
+     *
+     * [selfDeviceId] when we decided ourselves. Needed to identify the
+     * *incident* rather than merely the moment, see [declinedIncidents].
+     */
+    var alarmSourceDevice = Protocol.DEVICE_ID_NONE
+        private set
+
+    /**
      * Until when alarm events arriving from peers are ignored.
      *
      * A group-wide "stop" cannot land on every phone in the same millisecond,
@@ -130,6 +139,48 @@ class ThreatEngine(
      * an echo.
      */
     private var alarmSuppressedUntil = 0L
+
+    /**
+     * Incidents this phone has been taken out of by hand, and when each was last
+     * heard on the air. Keyed by (source device, subject device).
+     *
+     * A fixed echo window is not enough on its own, and the field test showed
+     * exactly why: the phone that *decided* on an incident keeps `EVENT_ALARM` in
+     * every beacon for as long as it is alarming, which may be minutes. So a
+     * phone whose owner silenced it went quiet, waited out the fifteen second
+     * window, heard the originator still shouting about the very same incident —
+     * and started screaming again. Declining an incident is remembered for as
+     * long as that incident is still audible, and forgotten
+     * ([DECLINED_FORGET_MS]) once the source genuinely stops, so a *second*
+     * theft moments later is still heard.
+     */
+    private val declinedIncidents = HashMap<Int, Long>()
+
+    /**
+     * When an alarm was last heard from *a peer*.
+     *
+     * Deliberately not touched by this phone's own alarm: that is already visible
+     * as [state], and folding it in here would leave the group controls up for
+     * twelve seconds after a lone phone - or a rehearsal - had finished, claiming
+     * a group was shouting when nobody was.
+     *
+     * Together with [state] this drives [GuardSnapshot.groupAlarmActive], which
+     * is what keeps "stop everyone" reachable after this phone has stood itself
+     * down.
+     */
+    private var groupAlarmHeardAt = 0L
+
+    /**
+     * Group commands already seen, keyed by (event type, issuing device), with
+     * when each was last heard.
+     *
+     * Two jobs. It stops a relayed command coming back and being applied twice —
+     * which matters because "everybody disarm" stays in the air for the best part
+     * of a minute once several phones are repeating it, and re-applying it would
+     * undo a phone the user has just armed again. And it terminates the relay:
+     * each phone passes a command on exactly once.
+     */
+    private val commandsSeen = HashMap<Int, Long>()
 
     private var lastEvidenceAt = 0L
     private var radioProfile = RadioProfile.CALM
@@ -192,6 +243,8 @@ class ThreatEngine(
         // Arming is a deliberate fresh start, so whatever was being ignored
         // from the last incident stops being ignored.
         alarmSuppressedUntil = 0L
+        declinedIncidents.clear()
+        groupAlarmHeardAt = 0L
         endMotionEpisode()
         transition(now, GuardState.CALIBRATING)
     }
@@ -206,17 +259,18 @@ class ThreatEngine(
         val wasAnnouncing = state == GuardState.ALARM || state == GuardState.PENDING
         if (state == GuardState.ALARM) {
             listener.onAlarmCleared()
+            declineCurrentIncident(now)
         }
         if (groupWide || wasAnnouncing) suppressRelayedAlarms(now)
-        alarmReason = null
-        alarmOriginatedHere = false
-        alarmSubject = Protocol.DEVICE_ID_NONE
-        alarmSince = 0L
-        pendingSince = 0L
+        clearAlarmState()
         armedSince = 0L
         votes.clear()
         boxAlarmFired = false
         significantMotionPendingAt = 0L
+        // Every peer's in-flight suspicion goes with it. Leaving these set is
+        // what left the group list reading "moving away" about phones nobody was
+        // watching any more, for as long as the app stayed open.
+        peers.values.forEach { it.resetEpisode() }
         endMotionEpisode()
         transition(now, GuardState.DISARMED)
     }
@@ -224,13 +278,10 @@ class ThreatEngine(
     /** Stop the siren but keep protecting; baselines are relearned. */
     fun clearAlarm(now: Long) {
         if (state != GuardState.ALARM && state != GuardState.PENDING) return
+        if (state == GuardState.ALARM) declineCurrentIncident(now)
         listener.onAlarmCleared()
         suppressRelayedAlarms(now)
-        alarmReason = null
-        alarmOriginatedHere = false
-        alarmSubject = Protocol.DEVICE_ID_NONE
-        alarmSince = 0L
-        pendingSince = 0L
+        clearAlarmState()
         votes.clear()
         boxAlarmFired = false
         peers.values.forEach { it.resetBaseline() }
@@ -242,10 +293,71 @@ class ThreatEngine(
         transition(now, GuardState.CALIBRATING)
     }
 
+    /**
+     * "That was a false alarm — everybody stop, but keep guarding."
+     *
+     * Separate from [clearAlarm] because it has to work on a phone that is *not*
+     * itself alarming: the one thing the field test made unmistakable is that the
+     * person holding the phone that has already been silenced is exactly the
+     * person who needs to reach the ones that have not. So this arms the echo
+     * defences and declines the incident whether or not there is a local siren to
+     * stop, and the caller broadcasts `EVENT_ALARM_CLEAR` alongside it.
+     */
+    fun stopGroupAlarm(now: Long) {
+        suppressRelayedAlarms(now)
+        if (state == GuardState.ALARM || state == GuardState.PENDING) {
+            clearAlarm(now)
+            return
+        }
+        // Nothing local to stop, but a peer that is still shouting must not be
+        // allowed to drag this phone back into the incident it just called off.
+        declineHeardIncidents(now)
+    }
+
     fun panic(now: Long) {
         // A human pressing the button is never an echo of anything.
         alarmSuppressedUntil = 0L
+        declinedIncidents.clear()
         raiseAlarm(now, AlarmReason.PANIC, selfDeviceId)
+    }
+
+    /** Resets everything that describes "an alarm is happening here". */
+    private fun clearAlarmState() {
+        alarmReason = null
+        alarmOriginatedHere = false
+        alarmSubject = Protocol.DEVICE_ID_NONE
+        alarmSourceDevice = Protocol.DEVICE_ID_NONE
+        alarmSince = 0L
+        pendingSince = 0L
+    }
+
+    /**
+     * Records the incident currently sounding here as one the user has said no
+     * to, so its remaining packets - which may go on for minutes - cannot
+     * restart it.
+     */
+    private fun declineCurrentIncident(now: Long) {
+        val source = if (alarmSourceDevice == Protocol.DEVICE_ID_NONE) {
+            selfDeviceId
+        } else {
+            alarmSourceDevice
+        }
+        declinedIncidents[incidentKey(source, alarmSubject)] = now
+    }
+
+    /**
+     * As above, for every incident a peer is currently putting on the air.
+     *
+     * Only incidents heard as *events* count: those are the only ones that can
+     * drag this phone back in, and a peer that is merely joining in does not
+     * broadcast one.
+     */
+    private fun declineHeardIncidents(now: Long) {
+        for (peer in peers.values) {
+            if (peer.lastAlarmEventAt == 0L) continue
+            if (now - peer.lastAlarmEventAt > GROUP_ALARM_HOLD_MS) continue
+            declinedIncidents[incidentKey(peer.deviceId, peer.lastAlarmSubject)] = now
+        }
     }
 
     /**
@@ -301,7 +413,11 @@ class ThreatEngine(
     fun onPeerBeacon(now: Long, rssi: Int, beacon: Beacon) {
         if (beacon.deviceId == selfDeviceId) return
 
-        val peer = peers.getOrPut(beacon.deviceId) { PeerRecord(beacon.deviceId, now) }
+        val peer = peers.getOrPut(beacon.deviceId) {
+            PeerRecord(beacon.deviceId, now).also {
+                it.nameHuntUntil = now + PEER_INTRODUCTION_MS
+            }
+        }
         // How long the filter has been flying blind. Scan results arrive every
         // five seconds or so while calm and several times a second once the
         // radios escalate, and the filter has to be told which it is getting.
@@ -310,7 +426,9 @@ class ThreatEngine(
         } else {
             now - peer.lastSeenAt
         }
+        if (peer.lastSeenAt != 0L) peer.noteArrivalGap(sinceLastSample)
         peer.lastSeenAt = now
+        peer.silenceNoticedAt = 0L
         peer.flags = beacon.flags
         peer.battery = beacon.battery
         peer.txPowerRef = beacon.txPowerRef
@@ -321,8 +439,27 @@ class ThreatEngine(
         if (!beacon.carriesName) {
             peer.motionScore = beacon.motionScore
         } else {
-            nameAssembler.accept(beacon)?.let { peer.name = it }
+            // A name packet is only ever sent by a phone that is lying still, so
+            // the honest reading of the missing telemetry is zero rather than
+            // whatever the peer's score was last time it moved. Keeping the old
+            // value made a stationary phone look like a moving one to the
+            // occlusion gate, which is the one gate that stops a passer-by
+            // setting off the siren.
+            if (beacon.stationary) peer.motionScore = 0
+            nameAssembler.accept(beacon)?.let { name ->
+                if (peer.name != name) {
+                    peer.name = name
+                    listener.onPeerNameLearned(peer.deviceId, name)
+                }
+            }
         }
+
+        // The flag alone says "somebody in the group is making noise", which is
+        // what keeps the stop-everyone controls on screen. It deliberately does
+        // *not* record an incident: a phone that merely joined in carries the
+        // flag while its event slot is busy with something else entirely, so its
+        // subject field says nothing about what is being stolen.
+        if (beacon.alarming) groupAlarmHeardAt = now
 
         val filtered = peer.kalman.update(rssi.toDouble(), sinceLastSample)
         peer.trend.add(now, filtered)
@@ -445,6 +582,9 @@ class ThreatEngine(
     fun tick(now: Long) {
         pruneVotes(now)
         prunePeers(now)
+        pruneDeclinedIncidents(now)
+        pruneSeenCommands(now)
+        renewNameHunts(now)
 
         when (state) {
             GuardState.DISARMED -> Unit
@@ -497,24 +637,37 @@ class ThreatEngine(
         // A moving observer cannot tell "you walked away" from "I walked away",
         // so it abstains entirely rather than voting badly.
         if (!selfStationary) {
-            peers.values.forEach { it.dropStartedAt = 0L }
+            peers.values.forEach { it.resetEpisode() }
             retractOwnVotes()
             return
         }
 
         for (peer in peers.values) {
             if (!peer.armed) {
-                peer.dropStartedAt = 0L
+                peer.resetEpisode()
                 clearOwnVote(peer.deviceId)
                 continue
             }
 
+            // ---- has it vanished? ------------------------------------------
+            // Two conditions, not one. "Silent for longer than usual" is
+            // measured against the gaps this peer has actually been producing,
+            // because at a low scan duty cycle a ten second gap between two
+            // results is completely ordinary - and a fixed ten second rule
+            // therefore accused a phone lying on the same towel. And silence has
+            // to survive a few seconds of *escalated* radio: noticing it lifts
+            // the scanner to low latency, so a peer that was merely missed comes
+            // back within a second and the vote is never cast.
             val silentFor = now - peer.lastSeenAt
-            if (silentFor >= config.lostTimeoutMs) {
-                castOwnVote(now, peer.deviceId, VoteType.LOST)
+            if (silentFor >= staleAfterMs(peer)) {
+                if (peer.silenceNoticedAt == 0L) peer.silenceNoticedAt = now
                 noteEvidence(now)
+                if (now - peer.silenceNoticedAt >= LOST_CONFIRM_MS) {
+                    castOwnVote(now, peer.deviceId, VoteType.LOST)
+                }
                 continue
             }
+            peer.silenceNoticedAt = 0L
 
             if (!peer.kalman.initialised || peer.baseline.isNaN()) continue
 
@@ -537,7 +690,7 @@ class ThreatEngine(
                 // walk past constantly, and reacting to every one of them would
                 // hold the scanner at high duty all afternoon for nothing.
                 if (dropping) peer.occlusionSuppressions++
-                peer.dropStartedAt = 0L
+                peer.resetEpisode()
                 clearOwnVote(peer.deviceId)
                 continue
             }
@@ -567,10 +720,25 @@ class ThreatEngine(
                 }
             } else {
                 // Comfortably back to normal - forget the whole episode.
-                peer.dropStartedAt = 0L
+                peer.resetEpisode()
                 clearOwnVote(peer.deviceId)
             }
         }
+    }
+
+    /**
+     * How long a peer has to be silent before its telemetry stops counting as
+     * current, and before its absence is worth voting on.
+     *
+     * [EngineConfig.lostTimeoutMs] is a floor rather than the answer. The real
+     * question is how long a gap is *unusual for this peer*, which depends
+     * entirely on the scan duty cycle the user has chosen - and the whole class
+     * of "the group list flickers between arbitrary states" came from answering
+     * it with a constant.
+     */
+    private fun staleAfterMs(peer: PeerRecord): Long {
+        val fromObservedRate = (peer.worstRecentGapMs * GAP_TOLERANCE).toLong() + GAP_MARGIN_MS
+        return maxOf(config.lostTimeoutMs, fromObservedRate).coerceAtMost(MAX_STALE_MS)
     }
 
     private fun observeBox(now: Long) {
@@ -666,6 +834,39 @@ class ThreatEngine(
         gone.forEach { forgetPeer(it.deviceId) }
     }
 
+    /**
+     * A declined incident is forgotten once it stops being audible — not on a
+     * timer from when it was declined. See [declinedIncidents].
+     */
+    private fun pruneDeclinedIncidents(now: Long) {
+        declinedIncidents.entries.removeAll { now - it.value > DECLINED_FORGET_MS }
+    }
+
+    private fun pruneSeenCommands(now: Long) {
+        commandsSeen.entries.removeAll { now - it.value > COMMAND_MEMORY_MS }
+    }
+
+    /**
+     * Gives a still-anonymous peer another spell of fast radio, now and then.
+     *
+     * A name takes six separate packets, so the one-shot window from when a peer
+     * was first heard is a single roll of the dice: if the phone was in somebody's
+     * pocket for those twenty-five seconds, it stayed "Phone A31F" for the rest of
+     * the afternoon. Retrying costs a few seconds of radio a couple of times a
+     * minute, and only until the name arrives.
+     */
+    private fun renewNameHunts(now: Long) {
+        if (state == GuardState.ALARM || state == GuardState.PENDING) return
+        for (peer in peers.values) {
+            if (peer.name != null) continue
+            // Nothing to hunt for while the peer is not even being heard.
+            if (now - peer.lastSeenAt > staleAfterMs(peer)) continue
+            if (now >= peer.nameHuntUntil + NAME_HUNT_COOLDOWN_MS) {
+                peer.nameHuntUntil = now + NAME_HUNT_RETRY_MS
+            }
+        }
+    }
+
     /** Votes this device currently wants to broadcast, newest subject first. */
     fun activeVotes(now: Long): List<Pair<Int, Int>> {
         val out = ArrayList<Pair<Int, Int>>()
@@ -759,19 +960,26 @@ class ThreatEngine(
 
             Protocol.EVENT_ALARM -> {
                 if (!acceptControl(beacon)) return
+                noteGroupAlarm(now, peers[beacon.deviceId], beacon.subjectId)
+                if (declined(now, beacon.deviceId, beacon.subjectId)) return
                 if (now < alarmSuppressedUntil) return
                 if (state != GuardState.ALARM) {
-                    raiseAlarm(now, AlarmReason.RELAYED, beacon.subjectId, originatedHere = false)
+                    raiseAlarm(
+                        now, AlarmReason.RELAYED, beacon.subjectId,
+                        originatedHere = false, sourceDevice = beacon.deviceId,
+                    )
                 }
             }
 
             Protocol.EVENT_BOX_ALARM -> {
                 if (!acceptControl(beacon)) return
+                noteGroupAlarm(now, peers[beacon.deviceId], Protocol.DEVICE_ID_NONE)
+                if (declined(now, beacon.deviceId, Protocol.DEVICE_ID_NONE)) return
                 if (now < alarmSuppressedUntil) return
                 if (state != GuardState.ALARM) {
                     raiseAlarm(
                         now, AlarmReason.BOX_TAKEN, Protocol.DEVICE_ID_NONE,
-                        originatedHere = false,
+                        originatedHere = false, sourceDevice = beacon.deviceId,
                     )
                 }
             }
@@ -782,30 +990,102 @@ class ThreatEngine(
             // put this event on the air is the phone whose button was pressed.
             Protocol.EVENT_PANIC -> {
                 if (!acceptControl(beacon)) return
+                noteGroupAlarm(now, peers[beacon.deviceId], beacon.subjectId)
                 if (state != GuardState.ALARM) {
-                    raiseAlarm(now, AlarmReason.PANIC, beacon.subjectId, originatedHere = false)
+                    raiseAlarm(
+                        now, AlarmReason.PANIC, beacon.subjectId,
+                        originatedHere = false, sourceDevice = beacon.deviceId,
+                    )
                 }
             }
 
-            // Both of these start the echo window even when there is nothing to
-            // clear here: the point is to stop the packets still in the air
-            // from the cancelled incident from starting this phone up.
+            // All three group commands go through the same door: applied once,
+            // passed on once, and remembered for a while afterwards so the relays
+            // cannot re-apply them. See [EngineListener.onRelayGroupCommand] for
+            // why relaying is what finally made these dependable.
             Protocol.EVENT_ALARM_CLEAR -> {
                 if (!acceptControl(beacon)) return
+                // The echo defences are refreshed by *every* copy, not only the
+                // first: the incident is still being called off, and every extra
+                // second of protection against its own trailing packets is free.
                 suppressRelayedAlarms(now)
-                if (state == GuardState.ALARM || state == GuardState.PENDING) clearAlarm(now)
+                if (!firstSightOfCommand(now, beacon)) return
+                if (state == GuardState.ALARM || state == GuardState.PENDING) {
+                    clearAlarm(now)
+                } else {
+                    // Nothing local to stop, but a peer that has not caught up
+                    // must not be able to drag this phone into an incident the
+                    // group has just called off.
+                    declineHeardIncidents(now)
+                }
+                relayCommand(beacon)
             }
 
             Protocol.EVENT_DISARM_ALL -> {
                 if (!acceptControl(beacon)) return
                 suppressRelayedAlarms(now)
+                if (!firstSightOfCommand(now, beacon)) return
                 if (state != GuardState.DISARMED) disarm(now, groupWide = true)
+                relayCommand(beacon)
             }
 
             Protocol.EVENT_ARM_ALL -> {
                 if (!acceptControl(beacon)) return
+                if (!firstSightOfCommand(now, beacon)) return
                 if (state == GuardState.DISARMED) arm(now)
+                relayCommand(beacon)
             }
+        }
+    }
+
+    /**
+     * Which device *issued* a group command, as opposed to which one this copy
+     * arrived from.
+     *
+     * The issuer puts its own id in the subject field and every relay carries it
+     * through unchanged, so all copies of one command share an origin and can be
+     * recognised as the same decision. Falling back to the sender keeps commands
+     * that carry no subject working rather than treating each copy as new.
+     */
+    private fun commandOrigin(beacon: Beacon): Int =
+        if (beacon.subjectId == Protocol.DEVICE_ID_NONE) beacon.deviceId else beacon.subjectId
+
+    /**
+     * @return true when this is the first sight of this command, which is the
+     *   only time it is applied and the only time it is passed on.
+     */
+    private fun firstSightOfCommand(now: Long, beacon: Beacon): Boolean =
+        commandsSeen.put(commandKey(beacon.eventType, commandOrigin(beacon)), now) == null
+
+    private fun relayCommand(beacon: Beacon) {
+        listener.onRelayGroupCommand(beacon.eventType, commandOrigin(beacon))
+    }
+
+    /**
+     * Records that a command this phone issued itself is already accounted for,
+     * so the relays coming back from everybody else are not mistaken for a
+     * second decision.
+     */
+    fun noteOwnGroupCommand(now: Long, eventType: Int) {
+        commandsSeen[commandKey(eventType, selfDeviceId)] = now
+    }
+
+    /** True when the user has already said no to this exact incident. */
+    private fun declined(now: Long, sourceDevice: Int, subject: Int): Boolean {
+        val key = incidentKey(sourceDevice, subject)
+        if (!declinedIncidents.containsKey(key)) return false
+        // Still audible, so keep declining it. The entry expires only once the
+        // source genuinely stops, which is what keeps a *second* theft moments
+        // later audible.
+        declinedIncidents[key] = now
+        return true
+    }
+
+    private fun noteGroupAlarm(now: Long, peer: PeerRecord?, subject: Int) {
+        groupAlarmHeardAt = now
+        if (peer != null) {
+            peer.lastAlarmEventAt = now
+            peer.lastAlarmSubject = subject
         }
     }
 
@@ -843,11 +1123,13 @@ class ThreatEngine(
         reason: AlarmReason,
         subjectId: Int,
         originatedHere: Boolean = true,
+        sourceDevice: Int = selfDeviceId,
     ) {
         if (state == GuardState.ALARM) return
         alarmReason = reason
         alarmOriginatedHere = originatedHere
         alarmSubject = subjectId
+        alarmSourceDevice = sourceDevice
         alarmSince = now
         pendingSince = 0L
         transition(now, GuardState.ALARM)
@@ -911,7 +1193,7 @@ class ThreatEngine(
      * never set a name costs this once and not repeatedly.
      */
     private fun awaitingIntroduction(now: Long): Boolean = peers.values.any {
-        it.name == null && now - it.firstSeenAt < PEER_INTRODUCTION_MS
+        it.name == null && now < it.nameHuntUntil
     }
 
     // ---- warnings ---------------------------------------------------------
@@ -957,6 +1239,7 @@ class ThreatEngine(
         val peerSnapshots = peers.values.map { peer ->
             val metres = DistanceModel.estimateMetres(peer.kalman.value, peer.txPowerRef)
             val against = votes[peer.deviceId]?.size ?: 0
+            val staleAfter = staleAfterMs(peer)
             PeerSnapshot(
                 deviceId = peer.deviceId,
                 name = peer.name,
@@ -975,7 +1258,13 @@ class ThreatEngine(
                 boxGuardian = peer.boxGuardian,
                 simulated = peer.simulated,
                 lastSeenMsAgo = now - peer.lastSeenAt,
-                suspected = peer.dropStartedAt != 0L,
+                linkStale = now - peer.lastSeenAt >= staleAfter,
+                staleAfterMs = staleAfter,
+                // Reported only once an episode has had a moment to prove itself.
+                // Every brief dip used to repaint the card as "moving away", which
+                // on a busy beach is most of the time.
+                suspected = peer.dropStartedAt != 0L &&
+                    now - peer.dropStartedAt >= SUSPICION_VISIBLE_AFTER_MS,
                 votesAgainst = against,
                 votesRequired = requiredObserversFor(peer.deviceId),
             )
@@ -1002,6 +1291,7 @@ class ThreatEngine(
             alarmReason = alarmReason,
             alarmSubjectId = alarmSubject,
             alarmSinceMs = alarmSince,
+            groupAlarmActive = groupAlarmActive(now),
             peers = peerSnapshots,
             box = BoxSnapshot(
                 configured = boxConfigured,
@@ -1048,11 +1338,28 @@ class ThreatEngine(
     fun canBroadcastName(now: Long): Boolean {
         val slotFree = when (state) {
             GuardState.DISARMED -> true
-            GuardState.ARMED -> selfStationary
+            // CALIBRATING is included deliberately. It is eight seconds during
+            // which nobody is voting on anything yet, and it lands squarely in the
+            // middle of the window when two phones have just met and are both
+            // listening hardest - so excluding it threw away the best chance a
+            // name ever gets.
+            GuardState.CALIBRATING, GuardState.ARMED, GuardState.SUSPICIOUS -> selfStationary
             else -> false
         }
         return slotFree && activeVotes(now).isEmpty()
     }
+
+    /**
+     * True while the *group* is in an incident, whether or not this phone is.
+     *
+     * Held for a few seconds past the last thing we heard, because that is how
+     * long it takes to tell "everybody has stopped" from "the gap between two
+     * beacons".
+     */
+    fun groupAlarmActive(now: Long): Boolean =
+        state == GuardState.ALARM ||
+            now - groupAlarmHeardAt < GROUP_ALARM_HOLD_MS ||
+            peers.values.any { it.alarming && now - it.lastSeenAt < GROUP_ALARM_HOLD_MS }
 
     companion object {
         /** Sentinel for "this has not happened yet". */
@@ -1074,6 +1381,55 @@ class ThreatEngine(
         /** How long a newly met phone gets fast radio to introduce itself. */
         const val PEER_INTRODUCTION_MS = 25_000L
 
+        /** A later, shorter attempt at a name that never arrived first time. */
+        const val NAME_HUNT_RETRY_MS = 12_000L
+
+        /** ...spaced out by this much, so an unnamed phone is not a battery leak. */
+        const val NAME_HUNT_COOLDOWN_MS = 75_000L
+
+        /**
+         * How long silence has to persist *after* it was first noticed - and
+         * therefore after the radios were escalated - before a peer counts as
+         * gone.
+         *
+         * Noticing raises the scanner to low latency, so a peer that was simply
+         * missed by a slow scan window reappears within a second and no vote is
+         * ever cast. This is what stops a low duty cycle from being read as a
+         * theft, which in a two-phone group meant an immediate siren.
+         */
+        const val LOST_CONFIRM_MS = 3_000L
+
+        /** Multiple of the worst recent gap that still counts as normal. */
+        private const val GAP_TOLERANCE = 2.5
+
+        /** Absolute slack on top, for the first gaps after a profile change. */
+        private const val GAP_MARGIN_MS = 2_000L
+
+        /** However sparse the radio gets, silence this long is always suspicious. */
+        private const val MAX_STALE_MS = 30_000L
+
+        /** An episode has to last this long before the UI calls a peer suspect. */
+        private const val SUSPICION_VISIBLE_AFTER_MS = 1_000L
+
+        /**
+         * How long after the last alarm packet the group still counts as being in
+         * an incident, so the "stop everyone" controls stay reachable.
+         */
+        const val GROUP_ALARM_HOLD_MS = 12_000L
+
+        /** How long a declined incident stays declined after it was last heard. */
+        const val DECLINED_FORGET_MS = 12_000L
+
+        /**
+         * How long a group command is remembered, so its relays cannot re-apply
+         * it.
+         *
+         * Comfortably longer than the command stays in the air: the issuer repeats
+         * it for `BeaconComposer.CONTROL_REPEAT_MS` and each phone that hears it
+         * passes it on for `CONTROL_RELAY_MS`, which can chain.
+         */
+        const val COMMAND_MEMORY_MS = 90_000L
+
         /**
          * How long alarm events from peers are treated as echoes after a
          * group-wide stop. Comfortably longer than the command is repeated for,
@@ -1092,6 +1448,14 @@ class ThreatEngine(
             val delta = (candidate - last) and 0xFFFF
             return delta in 1..0x7FFF
         }
+
+        /** Identity of one incident: who put it on the air, and about whom. */
+        internal fun incidentKey(sourceDevice: Int, subject: Int): Int =
+            ((sourceDevice and 0xFFFF) shl 16) or (subject and 0xFFFF)
+
+        /** Identity of one group command: what it was, and who decided it. */
+        internal fun commandKey(eventType: Int, originId: Int): Int =
+            ((eventType and 0xFF) shl 16) or (originId and 0xFFFF)
     }
 }
 
@@ -1116,6 +1480,36 @@ private class PeerRecord(val deviceId: Int, val firstSeenAt: Long) {
     var lastSlope: Double = 0.0
     var occlusionSuppressions: Int = 0
 
+    /** When silence from this peer was first noticed; see `LOST_CONFIRM_MS`. */
+    var silenceNoticedAt: Long = 0
+
+    /** Until when this peer is worth spending fast radio on to learn its name. */
+    var nameHuntUntil: Long = 0
+
+    /** When this peer last put an alarm on the air, and about whom. */
+    var lastAlarmEventAt: Long = 0
+    var lastAlarmSubject: Int = Protocol.DEVICE_ID_NONE
+
+    /**
+     * The worst gap between two beacons seen from this peer recently.
+     *
+     * Rises immediately and decays slowly, on purpose: the question it answers is
+     * "how long a silence is normal here", and a mean would be dragged to
+     * milliseconds by one burst of fast scanning and then read an ordinary calm
+     * gap as a vanished phone.
+     */
+    var worstRecentGapMs: Double = 0.0
+        private set
+
+    fun noteArrivalGap(gapMs: Long) {
+        val gap = gapMs.toDouble().coerceAtMost(MAX_TRACKED_GAP_MS)
+        worstRecentGapMs = if (gap > worstRecentGapMs) {
+            gap
+        } else {
+            worstRecentGapMs * 0.9 + gap * 0.1
+        }
+    }
+
     val armed: Boolean get() = flags and Protocol.FLAG_ARMED != 0
     val alarming: Boolean get() = flags and Protocol.FLAG_ALARMING != 0
     val stationary: Boolean get() = flags and Protocol.FLAG_STATIONARY != 0
@@ -1125,6 +1519,17 @@ private class PeerRecord(val deviceId: Int, val firstSeenAt: Long) {
         baselineWindow.clear()
         trend.clear()
         baseline = Double.NaN
+        resetEpisode()
+    }
+
+    /** Forgets any in-flight suspicion without touching the learned baseline. */
+    fun resetEpisode() {
         dropStartedAt = 0
+        silenceNoticedAt = 0
+    }
+
+    private companion object {
+        /** Beyond this a gap says "gone", not "slow", so it must not widen the bar. */
+        const val MAX_TRACKED_GAP_MS = 8_000.0
     }
 }

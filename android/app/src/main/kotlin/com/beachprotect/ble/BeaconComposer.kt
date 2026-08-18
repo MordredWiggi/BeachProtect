@@ -25,13 +25,21 @@ class BeaconComposer(private val store: GuardStore) {
     private var controlAlternates = false
 
     /**
-     * Queues a group command. Repeated for [CONTROL_REPEAT_MS] so that a peer
-     * whose scan window happened to be closed still hears it.
+     * Queues a group command, repeated for [durationMs] so that a peer whose scan
+     * window happened to be closed still hears it.
+     *
+     * @param durationMs [CONTROL_REPEAT_MS] when this phone is the one deciding,
+     *        [CONTROL_RELAY_MS] when it is passing somebody else's decision on.
      */
-    fun queueControl(now: Long, eventType: Int, subjectId: Int) {
+    fun queueControl(
+        now: Long,
+        eventType: Int,
+        subjectId: Int,
+        durationMs: Long = CONTROL_REPEAT_MS,
+    ) {
         controlEvent = eventType
         controlSubject = subjectId
-        controlUntil = now + CONTROL_REPEAT_MS
+        controlUntil = now + durationMs
         controlAlternates = false
     }
 
@@ -133,12 +141,29 @@ class BeaconComposer(private val store: GuardStore) {
          * How long a queued group command keeps being repeated.
          *
          * Sized against the slowest listener rather than against how long the
-         * command "feels" like it should take: two full LOW_POWER scan cycles
-         * plus margin, so every phone in the group gets several chances to hear
-         * it. The sender also lifts its advertising rate for the duration (see
-         * `GuardService.announcing`), which is the other half of making these
-         * commands dependable.
+         * command "feels" like it should take. Twelve seconds was the previous
+         * answer and it was still not enough: on the saver profile the listener
+         * samples for half a second every five, so twelve seconds is barely two
+         * chances - and "arm all" reached the other phone about half the time.
+         * Half a minute is several chances even at the sparsest duty cycle, and
+         * it costs nothing when nothing is being announced.
+         *
+         * Two other things carry the same load: the sender lifts its advertising
+         * rate for the duration (see `GuardService.announcing`), because the
+         * listener's duty cycle is the one thing it cannot change, and every
+         * phone that hears a command passes it on (see
+         * `EngineListener.onRelayGroupCommand`).
          */
-        const val CONTROL_REPEAT_MS = 12_000L
+        const val CONTROL_REPEAT_MS = 30_000L
+
+        /**
+         * How long a phone repeats somebody *else's* command.
+         *
+         * Shorter than the issuer's own window: the point of a relay is to reach
+         * phones the issuer cannot, which happens in the first few seconds, and a
+         * whole group holding its radios up for half a minute each would turn one
+         * button press into a measurable dent in the afternoon.
+         */
+        const val CONTROL_RELAY_MS = 10_000L
     }
 }

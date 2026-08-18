@@ -166,7 +166,20 @@ data class EngineConfig(
     /** Absolute floor for the above. Never fewer than this many witnesses. */
     val minObservers: Int = 1,
 
-    /** Silence from an armed peer that counts as "vanished". */
+    /**
+     * Silence from an armed peer that counts as "vanished" — a *floor*, not the
+     * whole rule.
+     *
+     * This used to be the entire test, and it was wrong in exactly the way that
+     * matters: how long a gap between two beacons is *normal* depends on the
+     * scan duty cycle, which the user chooses. At the old calm profile a ten
+     * second gap between two scan results was completely ordinary, so an
+     * observer voted LOST about a phone lying right next to it — and with two
+     * phones in the group one vote is the whole consensus, so it alarmed on the
+     * spot. The engine now also requires the silence to be several times the
+     * gap it has actually been seeing from that peer, and to persist while the
+     * radios are escalated (`ThreatEngine.LOST_CONFIRM_MS`).
+     */
     val lostTimeoutMs: Long = 10_000,
 
     /**
@@ -266,6 +279,23 @@ data class PeerSnapshot(
     val boxGuardian: Boolean,
     val simulated: Boolean,
     val lastSeenMsAgo: Long,
+
+    /**
+     * True when this peer has been silent for longer than is normal *for the
+     * current scan duty cycle*, so none of the telemetry above should be read
+     * as current.
+     *
+     * Decided here rather than in the UI on purpose. The UI used to apply its
+     * own fixed eight second rule, which at the calm profile is shorter than an
+     * ordinary gap between two scan results — so a phone lying on the same towel
+     * flipped between "still, watched" and "no signal" once a second, and after
+     * an incident it went on showing a stale "alarming" flag for minutes. One
+     * threshold, computed where the arrival times are known.
+     */
+    val linkStale: Boolean,
+
+    /** The threshold behind [linkStale], so the UI can say how long it has been. */
+    val staleAfterMs: Long,
     val suspected: Boolean,
     val votesAgainst: Int,
     val votesRequired: Int,
@@ -310,6 +340,19 @@ data class GuardSnapshot(
     val alarmReason: AlarmReason?,
     val alarmSubjectId: Int,
     val alarmSinceMs: Long,
+
+    /**
+     * True while *the group* is in an incident, whether or not this phone is
+     * still part of it.
+     *
+     * The alarm controls used to be gated on this phone's own state, which meant
+     * the moment somebody disarmed their own handset the buttons for "stop
+     * everyone's siren" disappeared and were replaced by "Arm all" — while every
+     * other phone in the group carried on screaming with no way left to reach
+     * them. Whether the group is shouting is not the same question as whether
+     * this phone is.
+     */
+    val groupAlarmActive: Boolean,
     val peers: List<PeerSnapshot>,
     val box: BoxSnapshot,
     val warnings: Set<GuardWarning>,
@@ -327,6 +370,31 @@ interface EngineListener {
 
     /** Put [eventType] into the outgoing beacon's event slot. */
     fun onBroadcastEvent(eventType: Int, subjectId: Int)
+
+    /**
+     * Pass a group command on to the rest of the group.
+     *
+     * Group commands have no acknowledgement and travel to phones that are
+     * listening a fraction of the time, so the phone that issued one is not a
+     * good enough sole source: in a three-phone group the far phone may hear
+     * nobody but the middle one. Every phone therefore re-broadcasts a command
+     * the first time it sees it, which turns a single burst into an epidemic that
+     * reaches everyone in range of *anyone*. It terminates because a command is
+     * relayed only on first sight ([ThreatEngine.COMMAND_MEMORY_MS]).
+     *
+     * @param originId the device that *issued* the command, carried unchanged
+     *        through every relay so all copies are recognisable as one command.
+     */
+    fun onRelayGroupCommand(eventType: Int, originId: Int)
+
+    /**
+     * A peer's display name has been fully reassembled from its beacons.
+     *
+     * Worth persisting: names arrive two characters at a time over six separate
+     * packets, so they are expensive to learn and must not be thrown away
+     * because the peer went quiet for five minutes or the service restarted.
+     */
+    fun onPeerNameLearned(deviceId: Int, name: String)
 
     /** Re-tune the radios. */
     fun onRadioProfileChanged(profile: RadioProfile)

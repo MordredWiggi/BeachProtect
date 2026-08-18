@@ -145,6 +145,42 @@
                 android:textSize="20sp"
                 android:textStyle="bold" />
 
+            <!--
+              What the primary button does depends on the mode, and the pair of
+              them is the whole answer to "one phone was silenced and the rest
+              kept screaming". Stopping an alarm and standing the group down are
+              different decisions, and a false alarm - which is most of them -
+              wants the first one.
+            -->
+            <TextView
+                android:id="@+id/disarmHint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center"
+                android:text="@string/stop_alarm_hint"
+                android:textColor="@color/bp_foam"
+                android:alpha="0.7"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/disarmGroupButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:paddingTop="14dp"
+                android:paddingBottom="14dp"
+                android:text="@string/disarm_everyone"
+                android:textColor="@color/bp_foam"
+                android:alpha="0.85"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+
             <TextView
                 android:id="@+id/biometricButton"
                 android:layout_width="wrap_content"

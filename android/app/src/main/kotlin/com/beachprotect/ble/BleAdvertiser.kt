@@ -35,7 +35,24 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
     private val handler = Handler(Looper.getMainLooper())
     private var advertisingSet: AdvertisingSet? = null
     private var currentProfile: RadioProfile? = null
+
+    /**
+     * The profile that was asked for while a start was still in flight.
+     *
+     * Bringing an advertising set up is asynchronous, and a request that arrived
+     * during that window used to be dropped on the floor - the profile field kept
+     * the old value and nothing ever retried, because the health check only looks
+     * at whether advertising is running at all. The result was a phone that
+     * announced a group command at the *calm* one-per-second rate to a listener
+     * sampling ten percent of the time, which is most of the reason "arm all"
+     * worked about half the time. Requests are now remembered and applied the
+     * moment the stack comes back.
+     */
+    private var pendingProfile: RadioProfile? = null
     private var payload: ByteArray? = null
+
+    /** The profile currently on the air, for callers checking they got it. */
+    val activeProfile: RadioProfile? get() = if (running) currentProfile else null
 
     /** True between requesting a start and the stack confirming it. */
     var starting = false
@@ -68,6 +85,14 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
                 Log.w(TAG, "advertising set failed to start: status=$status")
                 running = false
                 startRejected = true
+                currentProfile = null
+                // Retry from whatever was asked for last, so a transient
+                // rejection is not a silently invisible phone until the next
+                // health check.
+                pendingProfile?.let { profile ->
+                    pendingProfile = null
+                    payload?.let { handler.post { start(profile, it) } }
+                }
                 return
             }
             startRejected = false
@@ -75,6 +100,13 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
             running = true
             // A payload may have been queued while the set was coming up.
             payload?.let { pushPayload(it) }
+            // ...and so may a profile change. Applying it here is what keeps a
+            // group announcement from going out at the calm rate.
+            val wanted = pendingProfile
+            pendingProfile = null
+            if (wanted != null && wanted != currentProfile) {
+                payload?.let { handler.post { start(wanted, it) } }
+            }
         }
 
         override fun onAdvertisingSetStopped(set: AdvertisingSet?) {
@@ -107,9 +139,12 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
             pushPayload(initialPayload)
             return
         }
-        if (starting) return
+        if (starting) {
+            pendingProfile = profile
+            return
+        }
 
-        stop()
+        stopSet()
         currentProfile = profile
         starting = true
 
@@ -164,8 +199,19 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
         }
     }
 
-    @SuppressLint("MissingPermission")
     fun stop() {
+        pendingProfile = null
+        handler.removeCallbacksAndMessages(null)
+        stopSet()
+    }
+
+    /**
+     * Tears the advertising set down without discarding a queued profile change —
+     * which is exactly what re-tuning needs, and what a caller-visible [stop]
+     * must not do.
+     */
+    @SuppressLint("MissingPermission")
+    private fun stopSet() {
         val advertiser = adapter?.bluetoothLeAdvertiser
         if (advertiser != null && (running || starting)) {
             try {
@@ -178,7 +224,6 @@ class BleAdvertiser(private val adapter: BluetoothAdapter?) {
         running = false
         starting = false
         currentProfile = null
-        handler.removeCallbacksAndMessages(null)
     }
 
     private fun intervalFor(profile: RadioProfile): Int = when (profile) {

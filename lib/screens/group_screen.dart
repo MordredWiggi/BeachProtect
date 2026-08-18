@@ -151,14 +151,21 @@ class GroupScreen extends StatelessWidget {
                     SettingTile(
                       leading: Icon(
                         Icons.smartphone_rounded,
-                        color: snapshot.peers[i].armed
+                        color: snapshot.peers[i].armed &&
+                                !snapshot.peers[i].stale
                             ? context.status.armed
                             : context.status.disarmed,
                       ),
                       title: snapshot.peers[i].displayName,
-                      subtitle: snapshot.peers[i].armed
-                          ? 'Guarding  -  ${snapshot.peers[i].proximity.label.toLowerCase()}'
-                          : 'Not guarding',
+                      // Same rule as the home screen cards: a peer we cannot
+                      // currently hear is reported as unheard, not as whatever
+                      // it last said.
+                      subtitle: switch (snapshot.peers[i]) {
+                        final p when p.stale => 'Not heard from just now',
+                        final p when p.armed =>
+                          'Guarding  -  ${p.proximity.label.toLowerCase()}',
+                        _ => 'Not guarding',
+                      },
                       trailing: const Icon(Icons.edit_rounded, size: 18),
                       onTap: () => _renamePeer(context, controller, i),
                     ),

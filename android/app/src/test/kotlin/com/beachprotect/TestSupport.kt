@@ -16,6 +16,12 @@ class Recorder : EngineListener {
     val alarms = mutableListOf<Pair<AlarmReason, Int>>()
     val states = mutableListOf<GuardState>()
     val broadcasts = mutableListOf<Pair<Int, Int>>()
+
+    /** Group commands this phone was asked to pass on: event type to origin. */
+    val relays = mutableListOf<Pair<Int, Int>>()
+
+    /** Peer names fully reassembled from beacons: device id to name. */
+    val learnedNames = mutableListOf<Pair<Int, String>>()
     var clearedCount = 0
     var profile = RadioProfile.CALM
     var warnings: Set<GuardWarning> = emptySet()
@@ -43,6 +49,14 @@ class Recorder : EngineListener {
 
     override fun onBroadcastEvent(eventType: Int, subjectId: Int) {
         broadcasts += eventType to subjectId
+    }
+
+    override fun onRelayGroupCommand(eventType: Int, originId: Int) {
+        relays += eventType to originId
+    }
+
+    override fun onPeerNameLearned(deviceId: Int, name: String) {
+        learnedNames += deviceId to name
     }
 
     override fun onRadioProfileChanged(profile: RadioProfile) {

@@ -93,6 +93,7 @@ class GuardStore(context: Context) {
         val secret = Protocol.newGroupSecret()
         groupSecret = secret
         groupName = name
+        forgetPeerIdentities()
         return Protocol.encodeGroupCode(secret)
     }
 
@@ -101,7 +102,21 @@ class GuardStore(context: Context) {
         val secret = Protocol.decodeGroupCode(code) ?: return false
         groupSecret = secret
         groupName = name
+        forgetPeerIdentities()
         return true
+    }
+
+    /**
+     * Everything keyed by device id, dropped whenever the group changes.
+     *
+     * Device ids are a hash of the group secret and the peer's install id, so the
+     * same friend is a different id in a different group - and a name left over
+     * from the old one would either vanish or, if two ids collided, be attached to
+     * the wrong phone.
+     */
+    private fun forgetPeerIdentities() {
+        peerNames = emptyMap()
+        learnedPeerNames = emptyMap()
     }
 
     fun leaveGroup() {
@@ -109,6 +124,9 @@ class GuardStore(context: Context) {
         groupName = ""
         armed = false
         peerNames = emptyMap()
+        // Device ids are derived from the group secret, so nothing learned in the
+        // old group can mean anything in the next one.
+        learnedPeerNames = emptyMap()
     }
 
     // ---- monotonic sequence ---------------------------------------------
@@ -281,6 +299,35 @@ class GuardStore(context: Context) {
         peerNames = next
     }
 
+    /**
+     * Names peers have told us themselves, as opposed to nicknames the user
+     * typed.
+     *
+     * Kept separately and persisted because they are expensive to learn: a name
+     * travels two characters at a time and needs six different packets to land, so
+     * losing one because the peer went quiet for five minutes or the service was
+     * restarted meant the group list dropping back to hexadecimal ids - which
+     * from the outside is indistinguishable from names never having worked.
+     */
+    var learnedPeerNames: Map<Int, String>
+        get() {
+            val raw = prefs.getString(KEY_LEARNED_NAMES, null) ?: return emptyMap()
+            return runCatching {
+                val json = JSONObject(raw)
+                json.keys().asSequence().associate { it.toInt() to json.getString(it) }
+            }.getOrDefault(emptyMap())
+        }
+        set(value) {
+            val json = JSONObject()
+            value.forEach { (id, name) -> json.put(id.toString(), name) }
+            prefs.edit().putString(KEY_LEARNED_NAMES, json.toString()).apply()
+        }
+
+    fun rememberLearnedName(deviceId: Int, name: String) {
+        if (learnedPeerNames[deviceId] == name) return
+        learnedPeerNames = learnedPeerNames + (deviceId to name)
+    }
+
     // ---- detector tuning -------------------------------------------------
 
     var engineConfig: EngineConfig
@@ -406,6 +453,7 @@ class GuardStore(context: Context) {
         private const val KEY_BOX_NAME = "box_name"
         private const val KEY_BOX_BLE_ADDRESS = "box_ble_address"
         private const val KEY_PEER_NAMES = "peer_names"
+        private const val KEY_LEARNED_NAMES = "learned_peer_names"
         private const val KEY_DROP_DB = "drop_db"
         private const val KEY_SUSTAIN_MS = "sustain_ms"
         private const val KEY_CONSENSUS_RATIO = "consensus_ratio"

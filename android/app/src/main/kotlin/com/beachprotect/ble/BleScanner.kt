@@ -63,8 +63,23 @@ class BleScanner(
     private var currentRadio: RadioProfile? = null
     private var currentPower: PowerProfile? = null
     private var boxAddress: String? = null
-    private var lastStartAt = 0L
     private var pendingRestart = false
+
+    /**
+     * When each of the last few scans was started.
+     *
+     * Android blocks an app that starts a scan more than five times in thirty
+     * seconds, and a blocked scanner is a guard that does not work - so the old
+     * code simply refused to restart more often than once every six seconds. That
+     * is safe but too blunt: hearing a group command, or the first hint of a
+     * theft, has to raise the duty cycle *now*, and waiting up to six seconds for
+     * permission is several scan windows of the very thing we are trying to catch.
+     *
+     * Tracking the actual starts spends the allowance where it matters instead of
+     * rationing it evenly. Escalations go straight through while there is room;
+     * only when the allowance is genuinely nearly used up does anything wait.
+     */
+    private val recentStarts = ArrayDeque<Long>()
 
     var running: Boolean = false
         private set
@@ -112,20 +127,37 @@ class BleScanner(
         boxAddress = boxBleAddress
         if (!changed && running) return
 
-        val since = SystemClock.elapsedRealtime() - lastStartAt
-        if (running && since < MIN_RESTART_INTERVAL_MS) {
-            // Too soon. Schedule one restart for when the window opens; any
-            // further changes before then simply update the fields above.
+        val waitMs = if (running) delayBeforeNextStart() else 0L
+        if (waitMs > 0) {
+            // The allowance really is used up. Schedule one restart for when it
+            // opens again; any further changes before then simply update the
+            // fields above, so the scan that eventually starts is the current one.
             if (!pendingRestart) {
                 pendingRestart = true
                 handler.postDelayed({
                     pendingRestart = false
                     restartNow()
-                }, MIN_RESTART_INTERVAL_MS - since)
+                }, waitMs)
             }
             return
         }
         restartNow()
+    }
+
+    /**
+     * How long to wait before starting another scan, to stay under Android's
+     * "five starts in thirty seconds" ceiling.
+     *
+     * One slot of the five is deliberately held back for the case that matters
+     * most: a genuine escalation arriving right after a run of ordinary changes.
+     */
+    private fun delayBeforeNextStart(): Long {
+        val now = SystemClock.elapsedRealtime()
+        while (recentStarts.isNotEmpty() && now - recentStarts.first() > START_WINDOW_MS) {
+            recentStarts.removeFirst()
+        }
+        if (recentStarts.size < MAX_STARTS_PER_WINDOW) return 0L
+        return START_WINDOW_MS - (now - recentStarts.first()) + 100L
     }
 
     @SuppressLint("MissingPermission")
@@ -156,7 +188,7 @@ class BleScanner(
         try {
             scanner.startScan(filters, settings, callback)
             running = true
-            lastStartAt = SystemClock.elapsedRealtime()
+            recentStarts.addLast(SystemClock.elapsedRealtime())
         } catch (e: SecurityException) {
             running = false
             Log.w(TAG, "missing BLUETOOTH_SCAN permission", e)
@@ -206,11 +238,19 @@ class BleScanner(
             .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
             .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
 
+        // The calm duty cycle is not just an energy setting: it decides how long
+        // a gap between two beacons is *normal*, and therefore how quickly the
+        // group notices anything at all. LOW_POWER is a 512 ms window every
+        // 5.12 s, which is sparse enough that on a two-phone group the default
+        // profile spent its time flickering between "watched" and "no signal" and
+        // missing half the group commands. Balanced is now genuinely balanced, and
+        // the sparse setting is the one you have to choose.
         val scanMode = when (radio) {
             RadioProfile.ALERT, RadioProfile.CRITICAL -> ScanSettings.SCAN_MODE_LOW_LATENCY
             RadioProfile.CALM -> when (power) {
-                PowerProfile.MAX_PROTECTION -> ScanSettings.SCAN_MODE_BALANCED
-                PowerProfile.BALANCED, PowerProfile.ULTRA_SAVER -> ScanSettings.SCAN_MODE_LOW_POWER
+                PowerProfile.MAX_PROTECTION -> ScanSettings.SCAN_MODE_LOW_LATENCY
+                PowerProfile.BALANCED -> ScanSettings.SCAN_MODE_BALANCED
+                PowerProfile.ULTRA_SAVER -> ScanSettings.SCAN_MODE_LOW_POWER
             }
         }
         builder.setScanMode(scanMode)
@@ -245,11 +285,11 @@ class BleScanner(
     companion object {
         private const val TAG = "BpScanner"
 
-        /**
-         * Android blocks apps that toggle scanning more than 5 times in 30 s.
-         * Six seconds between restarts keeps us comfortably legal.
-         */
-        const val MIN_RESTART_INTERVAL_MS = 6_000L
+        /** Android's own limit: five scan starts inside this window gets you blocked. */
+        const val START_WINDOW_MS = 30_000L
+
+        /** ...so we use four and keep the fifth in reserve. */
+        const val MAX_STARTS_PER_WINDOW = 4
 
         private const val RETRY_DELAY_MS = 4_000L
         private const val BATCH_DELAY_MS = 2_500L

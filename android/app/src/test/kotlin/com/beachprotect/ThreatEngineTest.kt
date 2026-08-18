@@ -937,6 +937,300 @@ class ThreatEngineTest {
     }
 
     // =====================================================================
+    // Group commands actually reaching everybody
+    // =====================================================================
+
+    /**
+     * A command has to survive a listener that is awake a fraction of the time,
+     * with nothing acknowledging it. The issuer repeating itself is not enough:
+     * in a three-phone group the far phone may be in range of nobody but the
+     * middle one. Every phone therefore passes a command on the first time it
+     * sees it.
+     */
+    @Test
+    fun `a group command is passed on to the rest of the group`() {
+        val h = Harness()
+        h.settle()
+
+        // PEER_B decided this; we heard it from PEER_A, who was relaying.
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(
+                PEER_A, armed = false, seq = 5,
+                eventType = Protocol.EVENT_ARM_ALL, subjectId = PEER_B,
+            ),
+        )
+
+        assertEquals(GuardState.CALIBRATING, h.engine.state)
+        assertEquals(
+            "the origin has to travel unchanged, or the copies stop being one command",
+            listOf(Protocol.EVENT_ARM_ALL to PEER_B), h.recorder.relays,
+        )
+
+        // A third copy, from yet another phone. Passing it on again would be a
+        // flood that never terminates.
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_C, seq = 6, eventType = Protocol.EVENT_ARM_ALL, subjectId = PEER_B),
+        )
+        assertEquals("relayed exactly once", 1, h.recorder.relays.size)
+    }
+
+    @Test
+    fun `the phone that issued a command ignores it coming back`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        // This phone told everybody to stand down, and stood itself down...
+        h.engine.noteOwnGroupCommand(h.now, Protocol.EVENT_DISARM_ALL)
+        h.engine.disarm(h.now, groupWide = true)
+        // ...and then thought better of it.
+        h.engine.arm(h.now)
+
+        // Meanwhile the group is still passing the command around.
+        var seq = 50
+        h.advance(20_000, stepMs = 1_000) { t ->
+            h.engine.onPeerBeacon(
+                t, -60,
+                beacon(
+                    PEER_A, seq = ++seq,
+                    eventType = Protocol.EVENT_DISARM_ALL, subjectId = SELF_ID,
+                ),
+            )
+        }
+
+        assertNotEquals(
+            "an echo of your own command is not a second decision",
+            GuardState.DISARMED, h.engine.state,
+        )
+        assertTrue(h.recorder.relays.isEmpty())
+    }
+
+    /**
+     * The cost of relaying, if it were not paid attention to: a command stays in
+     * the air far longer than the issuer's own burst, so re-applying every copy
+     * would quietly undo a phone the user has just armed again.
+     */
+    @Test
+    fun `a relay arriving after the user re-armed does not stand them down again`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(
+                PEER_A, seq = 20,
+                eventType = Protocol.EVENT_DISARM_ALL, subjectId = PEER_A,
+            ),
+        )
+        assertEquals(GuardState.DISARMED, h.engine.state)
+
+        h.engine.arm(h.now)
+
+        var seq = 20
+        h.advance(20_000, stepMs = 1_000) { t ->
+            h.engine.onPeerBeacon(
+                t, -60,
+                beacon(
+                    PEER_B, seq = ++seq,
+                    eventType = Protocol.EVENT_DISARM_ALL, subjectId = PEER_A,
+                ),
+            )
+        }
+
+        assertNotEquals(GuardState.DISARMED, h.engine.state)
+    }
+
+    // =====================================================================
+    // Peer presence at a low scan duty cycle
+    // =====================================================================
+
+    /**
+     * Regression test for the noisiest failure of the whole field test.
+     *
+     * How long a gap between two beacons is *normal* depends on the scan duty
+     * cycle the user chose, and the loss test used to be a flat ten seconds. On
+     * the saver profile a twelve second gap is completely ordinary - so an
+     * observer voted LOST about a phone lying on the same towel, and with two
+     * phones in the group one vote is the entire consensus. The result was a
+     * siren, followed by a group list flickering between arbitrary states.
+     */
+    @Test
+    fun `an ordinary gap between scan results is not a vanished phone`() {
+        val h = Harness()
+        h.settle()
+        h.engine.arm(h.now)
+
+        h.advance(120_000, stepMs = 1_000) { t ->
+            if ((t / 1_000) % 12 == 0L) h.engine.onPeerBeacon(t, -60, beacon(PEER_A))
+        }
+
+        assertFalse("a sparse radio is not a theft", h.recorder.alarmed)
+        assertTrue(
+            "and the peer is still there",
+            h.engine.snapshot(h.now).peers.single().armed,
+        )
+    }
+
+    @Test
+    fun `a peer missed for a moment is never voted lost`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        // Silence for a shade over the timeout: enough to be noticed and to
+        // escalate the radios, not enough to conclude anything.
+        h.advance(11_000, stepMs = 500)
+        assertFalse("noticing silence is not the same as concluding theft", h.recorder.alarmed)
+
+        // ...and there it is again, which is what escalating was for.
+        h.advance(10_000, stepMs = 500) { t -> h.engine.onPeerBeacon(t, -60, beacon(PEER_A)) }
+
+        assertFalse(h.recorder.alarmed)
+        assertTrue(h.engine.activeVotes(h.now).isEmpty())
+    }
+
+    @Test
+    fun `a peer that has gone quiet is reported as unheard rather than as stale news`() {
+        val h = Harness()
+        h.armAndCalibrate()
+        assertFalse(h.engine.snapshot(h.now).peers.single().linkStale)
+
+        h.advance(40_000, stepMs = 1_000)
+        assertTrue(h.engine.snapshot(h.now).peers.single().linkStale)
+    }
+
+    // =====================================================================
+    // Getting out of a group alarm
+    // =====================================================================
+
+    /**
+     * Regression test.
+     *
+     * The phone that *decided* on an incident keeps `EVENT_ALARM` in every beacon
+     * for as long as it is alarming, which can be minutes. A fixed echo window
+     * therefore only postponed the problem: the phone whose owner had silenced it
+     * waited the window out, heard the originator still shouting about the very
+     * same incident, and started screaming again.
+     */
+    @Test
+    fun `an incident the user has silenced cannot restart itself later`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        var seq = 10
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = seq, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        assertEquals(GuardState.ALARM, h.engine.state)
+
+        h.engine.disarm(h.now)
+        h.advance(60_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(
+                t, -60,
+                beacon(
+                    PEER_A, seq = ++seq, alarming = true,
+                    eventType = Protocol.EVENT_ALARM, subjectId = PEER_B,
+                ),
+            )
+        }
+
+        assertNotEquals(GuardState.ALARM, h.engine.state)
+        assertEquals("the siren must have run exactly once", 1, h.recorder.alarms.size)
+    }
+
+    /**
+     * ...and the other half of that: this phone being out of the incident must
+     * not hide the fact that the rest of the group is still in it. Losing that
+     * is how somebody ended up with a screaming towel and an "Arm all" button.
+     */
+    @Test
+    fun `a phone that has stood itself down still knows the group is alarming`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        var seq = 10
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = seq, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        h.engine.disarm(h.now)
+        assertEquals(GuardState.DISARMED, h.engine.state)
+
+        h.advance(6_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(
+                t, -60,
+                beacon(
+                    PEER_A, seq = ++seq, alarming = true,
+                    eventType = Protocol.EVENT_ALARM, subjectId = PEER_B,
+                ),
+            )
+        }
+
+        assertTrue(
+            "the controls that reach the others have to stay reachable",
+            h.engine.snapshot(h.now).groupAlarmActive,
+        )
+    }
+
+    @Test
+    fun `stopping a false alarm leaves the phone guarding`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 10, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        assertEquals(GuardState.ALARM, h.engine.state)
+
+        h.engine.stopGroupAlarm(h.now)
+        h.advance(12_000, stepMs = 500) { t -> h.engine.onPeerBeacon(t, -60, beacon(PEER_A)) }
+
+        assertEquals(
+            "a false alarm must not cost the afternoon's guarding",
+            GuardState.ARMED, h.engine.state,
+        )
+        assertEquals(1, h.recorder.clearedCount)
+    }
+
+    @Test
+    fun `disarming forgets what it was suspicious about`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        // A moving peer whose signal recedes eight decibels and then holds: an
+        // episode is running, but it is short of what it takes to vote.
+        var rssi = -60.0
+        h.advance(2_000, stepMs = 250) { t ->
+            rssi -= 1.0
+            h.engine.onPeerBeacon(
+                t, rssi.toInt(),
+                beacon(PEER_A, stationary = false, motionScore = 180),
+            )
+        }
+        h.advance(3_000, stepMs = 250) { t ->
+            h.engine.onPeerBeacon(
+                t, rssi.toInt(),
+                beacon(PEER_A, stationary = false, motionScore = 180),
+            )
+        }
+        assertFalse("not enough to alarm on", h.recorder.alarmed)
+        assertTrue(
+            "the episode should be running by now",
+            h.engine.snapshot(h.now).peers.single().suspected,
+        )
+
+        h.engine.disarm(h.now)
+        h.advance(1_000, stepMs = 250)
+
+        assertFalse(
+            "a disarmed phone is not watching anybody",
+            h.engine.snapshot(h.now).peers.single().suspected,
+        )
+    }
+
+    // =====================================================================
     // Names
     // =====================================================================
 
@@ -1008,6 +1302,65 @@ class ThreatEngineTest {
             "an armed phone still owes its watchers a fresh motion score",
             h.engine.canBroadcastName(h.now),
         )
+    }
+
+    /**
+     * A name costs six separate packets to learn, so it must not be thrown away
+     * because the peer went quiet or the service restarted. The engine reports it
+     * once, and the store keeps it.
+     */
+    @Test
+    fun `a reassembled name is reported once so it can be kept`() {
+        val h = Harness()
+        h.settle()
+        h.engine.onPeerBeacon(h.now, -60, beacon(PEER_A, armed = false))
+
+        sendName(h, PEER_A, "Lisa", armed = false)
+        assertEquals(listOf(PEER_A to "Lisa"), h.recorder.learnedNames)
+
+        // The peer keeps introducing itself; that is not news.
+        sendName(h, PEER_A, "Lisa", armed = false)
+        assertEquals(1, h.recorder.learnedNames.size)
+    }
+
+    /**
+     * The introduction window used to be a single roll of the dice, anchored to
+     * when a peer was first heard. A phone that spent those twenty-five seconds in
+     * somebody's pocket stayed "Phone A31F" for the rest of the afternoon.
+     */
+    @Test
+    fun `a phone that stayed anonymous gets another chance later`() {
+        val h = Harness()
+        h.settle()
+
+        h.advance(ThreatEngine.PEER_INTRODUCTION_MS + 3_000, stepMs = 1_000) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, armed = false))
+        }
+        assertEquals("the first window is bounded", RadioProfile.CALM, h.recorder.profile)
+
+        h.advance(ThreatEngine.NAME_HUNT_COOLDOWN_MS + 2_000, stepMs = 1_000) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, armed = false))
+        }
+        assertEquals(
+            "but a nameless phone is worth trying again for",
+            RadioProfile.ALERT, h.recorder.profile,
+        )
+    }
+
+    /**
+     * The eight seconds after arming are when two phones that have just met are
+     * both listening hardest, and excluding them threw that away. Nothing is being
+     * voted on yet, so the event slot is genuinely free.
+     */
+    @Test
+    fun `a phone still calibrating introduces itself`() {
+        val h = Harness()
+        h.settle()
+        h.engine.arm(h.now)
+        h.advance(2_000, stepMs = 500) { t -> h.engine.onPeerBeacon(t, -60, beacon(PEER_A)) }
+
+        assertEquals(GuardState.CALIBRATING, h.engine.state)
+        assertTrue(h.engine.canBroadcastName(h.now))
     }
 
     @Test

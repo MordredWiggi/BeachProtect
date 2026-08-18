@@ -190,28 +190,33 @@ class GuardService : Service(),
                 // calling off an incident that never happened would start the
                 // echo window on every phone in the group for no reason.
                 if (engine.state == GuardState.ALARM) {
-                    composer.queueControl(now(), Protocol.EVENT_ALARM_CLEAR, store.deviceId)
+                    announceGroupCommand(Protocol.EVENT_ALARM_CLEAR)
                 }
                 engine.disarm(now())
                 store.armed = false
             }
 
+            // "That was a false alarm": silence the whole group and leave every
+            // phone, including this one, still guarding. This is deliberately not
+            // gated on this phone still alarming - the person who has already
+            // silenced their own handset is exactly the person who needs to reach
+            // the ones that are still screaming.
             GuardIntents.ACTION_CLEAR_ALARM -> {
                 ensureStarted()
-                composer.queueControl(now(), Protocol.EVENT_ALARM_CLEAR, store.deviceId)
-                engine.clearAlarm(now())
+                announceGroupCommand(Protocol.EVENT_ALARM_CLEAR)
+                engine.stopGroupAlarm(now())
             }
 
             GuardIntents.ACTION_DISARM_GROUP -> {
                 ensureStarted()
-                composer.queueControl(now(), Protocol.EVENT_DISARM_ALL, store.deviceId)
+                announceGroupCommand(Protocol.EVENT_DISARM_ALL)
                 engine.disarm(now(), groupWide = true)
                 store.armed = false
             }
 
             GuardIntents.ACTION_ARM_GROUP -> {
                 ensureStarted()
-                composer.queueControl(now(), Protocol.EVENT_ARM_ALL, store.deviceId)
+                announceGroupCommand(Protocol.EVENT_ARM_ALL)
                 engine.arm(now())
                 store.armed = true
             }
@@ -277,6 +282,23 @@ class GuardService : Service(),
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Puts a group command this phone has decided on into the air, and tells the
+     * engine it has already accounted for it.
+     *
+     * That second half matters: every phone that hears a command passes it on, so
+     * within a second or two the issuer is hearing its own decision echoed back
+     * from everybody else. Without recording it as already seen, the issuer would
+     * treat each echo as a fresh command and start relaying it again.
+     */
+    private fun announceGroupCommand(eventType: Int) {
+        val now = now()
+        engine.noteOwnGroupCommand(now, eventType)
+        composer.queueControl(now, eventType, store.deviceId)
+        advertiser.updatePayload(composeBeacon())
+        restartRadios()
+    }
 
     /**
      * The user swiped BeachProtect out of Recents.
@@ -428,8 +450,18 @@ class GuardService : Service(),
         if (adapter?.state != BluetoothAdapter.STATE_ON) return
 
         val advertiserDown = advertiser.supported && !advertiser.running && !advertiser.starting
-        if (advertiserDown || !scanner.running) {
-            Log.w(TAG, "radio health: advertising=${advertiser.running} scanning=${scanner.running}")
+        // ...and "up, but at the wrong rate" is just as broken while a group
+        // command is going out: the whole point of the lift is that the listener's
+        // duty cycle is the one thing the sender cannot change.
+        val wrongRate = advertiser.running &&
+            advertiser.activeProfile != null &&
+            advertiser.activeProfile != effectiveRadioProfile()
+        if (advertiserDown || wrongRate || !scanner.running) {
+            Log.w(
+                TAG,
+                "radio health: advertising=${advertiser.running}@${advertiser.activeProfile} " +
+                    "wanted=${effectiveRadioProfile()} scanning=${scanner.running}",
+            )
             restartRadios()
         }
     }
@@ -612,7 +644,12 @@ class GuardService : Service(),
 
             GuardState.ALARM -> motion.requestBurst(ALARM_BURST_MS)
 
-            GuardState.ARMED, GuardState.DISARMED -> {
+            // CALIBRATING belongs here too, and leaving it out was a visible
+            // bug: "stop the alarm, keep guarding" lands in CALIBRATING, so the
+            // alarm notification and the full-screen disarm surface both stayed
+            // up for the whole eight second calibration window after the user
+            // had already dealt with them.
+            GuardState.ARMED, GuardState.DISARMED, GuardState.CALIBRATING -> {
                 motion.relax()
                 notificationManager().cancel(NOTIFICATION_ID_ALARM)
                 broadcastUpdate(current, null, Protocol.DEVICE_ID_NONE, null, 0)
@@ -671,9 +708,9 @@ class GuardService : Service(),
             speak = store.speakReason,
         )
 
-        val name = engine.snapshot(now()).peers
-            .firstOrNull { it.deviceId == subjectId }?.name
-            ?: store.peerNames[subjectId]
+        val name = store.peerNames[subjectId]
+            ?: engine.snapshot(now()).peers.firstOrNull { it.deviceId == subjectId }?.name
+            ?: store.learnedPeerNames[subjectId]
             ?: if (subjectId == store.deviceId) store.selfName else null
 
         raiseAlarmScreen(GuardState.ALARM, reason, subjectId, 0)
@@ -693,6 +730,19 @@ class GuardService : Service(),
         if (rehearsing) return
         composer.queueControl(now(), eventType, subjectId)
         advertiser.updatePayload(composeBeacon())
+    }
+
+    override fun onRelayGroupCommand(eventType: Int, originId: Int) {
+        if (rehearsing) return
+        // The origin id travels unchanged, so every copy of the command stays
+        // recognisable as one decision and the flood terminates.
+        composer.queueControl(now(), eventType, originId, BeaconComposer.CONTROL_RELAY_MS)
+        advertiser.updatePayload(composeBeacon())
+        scheduleTick(immediate = true)
+    }
+
+    override fun onPeerNameLearned(deviceId: Int, name: String) {
+        store.rememberLearnedName(deviceId, name)
     }
 
     override fun onRadioProfileChanged(profile: RadioProfile) {
@@ -1077,7 +1127,17 @@ class GuardService : Service(),
             .setOngoing(true)
             .setAutoCancel(false)
             .setFullScreenIntent(fullScreen, true)
-            .addAction(0, "Disarm", servicePendingIntent(GuardIntents.ACTION_DISARM, REQUEST_DISARM))
+            // The same two decisions as the full-screen surface, for the same
+            // reason: a plain "Disarm" here silenced this phone, stood it down,
+            // and left everybody else screaming with no way back to them.
+            .addAction(
+                0, "Stop alarm",
+                servicePendingIntent(GuardIntents.ACTION_CLEAR_ALARM, REQUEST_STOP_ALARM),
+            )
+            .addAction(
+                0, "Disarm all",
+                servicePendingIntent(GuardIntents.ACTION_DISARM_GROUP, REQUEST_DISARM_GROUP),
+            )
             .build()
         runCatching { notificationManager().notify(NOTIFICATION_ID_ALARM, notification) }
     }
@@ -1098,7 +1158,7 @@ class GuardService : Service(),
         val name = if (subjectId == store.deviceId) {
             store.selfName
         } else {
-            store.peerNames[subjectId]
+            store.peerNames[subjectId] ?: store.learnedPeerNames[subjectId]
         }
         broadcastUpdate(state, reason, subjectId, name, pendingRemainingMs)
         runCatching {
@@ -1138,6 +1198,7 @@ class GuardService : Service(),
     fun currentSnapshotMap(): Map<String, Any?> = Codec.snapshot(
         engine.snapshot(now()),
         store.peerNames,
+        store.learnedPeerNames,
         diagnostics(),
     )
 
@@ -1179,6 +1240,8 @@ class GuardService : Service(),
         private const val REQUEST_ALARM_SCREEN = 13
         private const val REQUEST_HEARTBEAT = 14
         private const val REQUEST_PENDING_SCREEN = 15
+        private const val REQUEST_STOP_ALARM = 16
+        private const val REQUEST_DISARM_GROUP = 17
 
         /** How long a rehearsal alarm stays up before standing itself down. */
         private const val REHEARSAL_CLEAR_MS = 1_400L
@@ -1189,7 +1252,16 @@ class GuardService : Service(),
 
         private const val NOTIFICATION_THROTTLE_MS = 5_000L
         private const val BATTERY_POLL_MS = 60_000L
-        private const val RADIO_CHECK_MS = 15_000L
+
+        /**
+         * How often the radios are checked against what they are supposed to be
+         * doing.
+         *
+         * Was fifteen seconds, which is longer than a whole group announcement:
+         * an advertiser that failed to re-tune stayed wrong for the entire window
+         * it mattered in. The check itself costs a couple of field reads.
+         */
+        private const val RADIO_CHECK_MS = 4_000L
         private const val HEARTBEAT_INTERVAL_MS = 60_000L
         private const val ALARM_BURST_MS = 60_000L
         private const val WAKE_LOCK_TAG = "beachprotect:guard"

@@ -33,7 +33,14 @@ object GuardIntents {
     /** Tell every phone in the group to arm. */
     const val ACTION_ARM_GROUP = PREFIX + "ARM_GROUP"
 
-    /** Silence the sirens but keep guarding, relearning baselines. */
+    /**
+     * Silence the sirens across the whole group but leave every phone guarding,
+     * relearning baselines. The answer to a false alarm.
+     *
+     * Deliberately usable from a phone that is no longer alarming itself: whoever
+     * has already silenced their own handset is exactly the person who needs to
+     * reach the ones that have not.
+     */
     const val ACTION_CLEAR_ALARM = PREFIX + "CLEAR_ALARM"
 
     /** Manual panic button. */

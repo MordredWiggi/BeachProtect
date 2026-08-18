@@ -82,7 +82,16 @@ Quick version, from the repository root in PowerShell:
 5. **Going for a swim?** Just leave everything. Lifting your own phone makes it
    chirp immediately and show a disarm prompt — you have a few seconds to
    fingerprint or PIN it before the group alarm joins in.
-6. **Packing up?** **Disarm all.**
+6. **If the group alarm goes off**, the screen that comes up offers two
+   different things, and the first one is usually what you want:
+   - **Stop the alarm** — silences *every* phone in the group and leaves them
+     all guarding. This is the answer to a false alarm.
+   - **Stop and disarm everyone** — silences everybody and stands the whole
+     group down.
+
+   Both reach the whole group, from whichever phone you happen to be holding —
+   including one that has already gone quiet.
+7. **Packing up?** **Disarm all.**
 
 ## Testing it
 
@@ -101,7 +110,7 @@ With more phones:
 A guided eight-step field protocol with synchronised log capture from every
 device.
 
-Automated suites — 69 Kotlin tests on the detection engine, 11 Dart tests on
+Automated suites — 82 Kotlin tests on the detection engine, 14 Dart tests on
 snapshot decoding:
 
 ```powershell

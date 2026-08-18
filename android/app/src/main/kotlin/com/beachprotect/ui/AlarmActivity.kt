@@ -44,6 +44,21 @@ class AlarmActivity : AppCompatActivity() {
     private var enteredPin = StringBuilder()
     private var pinVisible = false
 
+    /**
+     * What a successful authentication will actually do.
+     *
+     * There are two quite different things somebody might want out of this
+     * screen, and the field test showed what happens when only one is offered.
+     * Silencing a group alarm used to *disarm the phone it was pressed on* while
+     * telling the others to keep guarding, so the group came out of every
+     * incident half armed, half not, and the phone that had just been silenced
+     * lost the buttons that could reach the ones still screaming. Now the default
+     * during an alarm is "stop everybody, keep everybody guarding" - because
+     * nearly every alarm somebody stands in front of is a false one - and
+     * standing the group down is a separate, deliberate choice.
+     */
+    private var pendingAction: String = GuardIntents.ACTION_DISARM
+
     private val updateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != GuardIntents.ACTION_GUARD_UPDATE) return
@@ -60,7 +75,14 @@ class AlarmActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         wireKeypad()
-        binding.disarmButton.setOnClickListener { onDisarmPressed() }
+        binding.disarmButton.setOnClickListener {
+            pendingAction = primaryAction()
+            onDisarmPressed()
+        }
+        binding.disarmGroupButton.setOnClickListener {
+            pendingAction = GuardIntents.ACTION_DISARM_GROUP
+            onDisarmPressed()
+        }
         binding.biometricButton.setOnClickListener { promptBiometric() }
 
         applyUpdate(intent)
@@ -134,6 +156,7 @@ class AlarmActivity : AppCompatActivity() {
         }
 
         mode = nextMode
+        pendingAction = primaryAction()
         reason = runCatching {
             AlarmReason.valueOf(intent?.getStringExtra(GuardIntents.EXTRA_REASON) ?: "")
         }.getOrNull()
@@ -152,10 +175,29 @@ class AlarmActivity : AppCompatActivity() {
         configureAuthUi()
     }
 
+    /**
+     * The button people press without reading.
+     *
+     * PENDING is this phone's own grace period - the owner has picked their phone
+     * up and wants it to stop guarding, and nothing has been announced to the
+     * group yet, so there is nothing to call off. An ALARM has been announced,
+     * and the useful thing is to call it off everywhere while leaving everyone's
+     * things protected.
+     */
+    private fun primaryAction(): String = if (mode == GuardState.PENDING) {
+        GuardIntents.ACTION_DISARM
+    } else {
+        GuardIntents.ACTION_CLEAR_ALARM
+    }
+
     private fun renderChrome() {
         val pending = mode == GuardState.PENDING
         val background = if (pending) R.color.bp_pending_deep else R.color.bp_alarm_deep
         binding.alarmRoot.setBackgroundColor(ContextCompat.getColor(this, background))
+
+        binding.disarmButton.setText(if (pending) R.string.disarm else R.string.stop_alarm)
+        binding.disarmHint.visibility = if (pending) View.GONE else View.VISIBLE
+        binding.disarmGroupButton.visibility = if (pending) View.GONE else View.VISIBLE
 
         binding.alarmTitle.setText(
             when {
@@ -339,7 +381,7 @@ class AlarmActivity : AppCompatActivity() {
     private fun succeed() {
         countdown?.cancel()
         val intent = Intent(this, com.beachprotect.service.GuardService::class.java).apply {
-            action = GuardIntents.ACTION_DISARM
+            action = pendingAction
             putExtra(GuardIntents.EXTRA_SOURCE, "alarm_screen")
         }
         ContextCompat.startForegroundService(this, intent)

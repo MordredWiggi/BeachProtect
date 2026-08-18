@@ -17,7 +17,16 @@ class PeerCard extends StatelessWidget {
     final Color tint;
     final String stateLine;
 
-    if (peer.alarming) {
+    // Staleness is tested *first*, and that ordering is the fix rather than a
+    // tidy-up. Everything below it — alarming, suspected, armed — is read off
+    // the last beacon this phone happened to catch, so a peer that has gone
+    // quiet was being rendered with whatever it last said: "Alarming" for
+    // minutes after an incident was over, "Not guarding" from a beacon caught
+    // mid-rearm. Silence is its own state, and it outranks memories.
+    if (peer.stale) {
+      tint = status.disarmed;
+      stateLine = 'No signal for ${(peer.lastSeenMsAgo / 1000).round()}s';
+    } else if (peer.alarming) {
       tint = status.alarm;
       stateLine = 'Alarming';
     } else if (peer.suspected) {
@@ -25,9 +34,6 @@ class PeerCard extends StatelessWidget {
       stateLine = peer.votesRequired > 1
           ? 'Moving away (${peer.votesAgainst}/${peer.votesRequired} agree)'
           : 'Moving away';
-    } else if (peer.stale) {
-      tint = status.disarmed;
-      stateLine = 'No signal for ${(peer.lastSeenMsAgo / 1000).round()}s';
     } else if (!peer.armed) {
       tint = status.disarmed;
       stateLine = 'Not guarding';
@@ -55,11 +61,13 @@ class PeerCard extends StatelessWidget {
                       shape: BoxShape.circle,
                     ),
                     child: Icon(
-                      peer.alarming
-                          ? Icons.warning_rounded
-                          : peer.stationary
-                              ? Icons.smartphone_rounded
-                              : Icons.directions_walk_rounded,
+                      peer.stale
+                          ? Icons.signal_cellular_off_rounded
+                          : peer.alarming
+                              ? Icons.warning_rounded
+                              : peer.stationary
+                                  ? Icons.smartphone_rounded
+                                  : Icons.directions_walk_rounded,
                       size: 20,
                       color: tint,
                     ),
@@ -139,14 +147,16 @@ class PeerCard extends StatelessWidget {
                       color: status.calibrating,
                       emphasise: true,
                     ),
-                  if (peer.dropDb != null && peer.dropDb! > 3)
+                  // Both of these describe the last packet we caught, so they
+                  // are hidden the moment that packet stops being current.
+                  if (!peer.stale && peer.dropDb != null && peer.dropDb! > 3)
                     InfoChip(
                       icon: Icons.trending_down_rounded,
                       label: '-${peer.dropDb!.toStringAsFixed(0)} dB',
                       color: peer.dropDb! > 10 ? status.suspicious : null,
                       emphasise: peer.dropDb! > 10,
                     ),
-                  if (!peer.stationary)
+                  if (!peer.stale && !peer.stationary)
                     InfoChip(
                       icon: Icons.vibration_rounded,
                       label: 'in motion',

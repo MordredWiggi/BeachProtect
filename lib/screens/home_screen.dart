@@ -126,7 +126,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ],
             const SizedBox(height: 20),
 
-            if (snapshot.state == GuardState.alarm) ...[
+            // Shown for as long as *the group* is in an incident, not just this
+            // phone. Silencing your own handset used to take these controls away
+            // while everybody else carried on screaming.
+            if (snapshot.state == GuardState.alarm ||
+                snapshot.groupAlarmActive) ...[
               _AlarmPanel(controller: controller, snapshot: snapshot),
               const SizedBox(height: 18),
             ],
@@ -507,6 +511,10 @@ class _AlarmPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final status = context.status;
+    // This phone is out of it, but somebody else is not. That combination used
+    // to be a dead end: no alarm panel, and a quick action offering to "Arm
+    // all" while the towel was still screaming.
+    final onlyOthers = snapshot.state != GuardState.alarm;
     return Container(
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
@@ -518,15 +526,27 @@ class _AlarmPanel extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            snapshot.alarmReason?.label ?? 'Theft alarm',
+            onlyOthers
+                ? 'The group is still alarming'
+                : snapshot.alarmReason?.label ?? 'Theft alarm',
             style: TextStyle(
               fontSize: 17,
               fontWeight: FontWeight.w800,
               color: status.alarm,
             ),
           ),
-          if (snapshot.alarmSubjectName != null) ...[
-            const SizedBox(height: 4),
+          const SizedBox(height: 4),
+          if (onlyOthers)
+            Text(
+              'This phone has stopped, but at least one other has not. '
+              'Either button below reaches all of them.',
+              style: TextStyle(
+                fontSize: 13.5,
+                height: 1.35,
+                color: context.colors.onSurface.withValues(alpha: 0.75),
+              ),
+            )
+          else if (snapshot.alarmSubjectName != null)
             Text(
               snapshot.alarmSubjectName!,
               style: TextStyle(
@@ -534,8 +554,8 @@ class _AlarmPanel extends StatelessWidget {
                 color: context.colors.onSurface.withValues(alpha: 0.75),
               ),
             ),
-          ],
-          if (!snapshot.diagnostics.sirenAudible) ...[
+          if (snapshot.state == GuardState.alarm &&
+              !snapshot.diagnostics.sirenAudible) ...[
             const SizedBox(height: 10),
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -559,15 +579,35 @@ class _AlarmPanel extends StatelessWidget {
             ),
           ],
           const SizedBox(height: 14),
+          // Two decisions, and the first one is the common case. Most alarms
+          // somebody is standing in front of are false, and what they want is
+          // quiet without giving up on the afternoon's guarding.
           FilledButton.icon(
             style: FilledButton.styleFrom(backgroundColor: status.alarm),
-            onPressed: () => controller.clearAlarm(),
+            onPressed: () async {
+              final messenger = ScaffoldMessenger.of(context);
+              await controller.clearAlarm();
+              messenger.showSnackBar(
+                const SnackBar(
+                  content: Text('Telling everyone to stop. All phones keep '
+                      'guarding.'),
+                ),
+              );
+            },
             icon: const Icon(Icons.volume_off_rounded),
-            label: const Text('Stop the noise, keep guarding'),
+            label: const Text('False alarm - stop everyone, keep guarding'),
           ),
           const SizedBox(height: 8),
           OutlinedButton.icon(
-            onPressed: () => controller.disarmGroup(),
+            onPressed: () async {
+              final messenger = ScaffoldMessenger.of(context);
+              await controller.disarmGroup();
+              messenger.showSnackBar(
+                const SnackBar(
+                  content: Text('Telling everyone to stop and stand down.'),
+                ),
+              );
+            },
             icon: const Icon(Icons.shield_outlined),
             label: const Text('Stop and disarm everyone'),
           ),
@@ -585,7 +625,10 @@ class _QuickActions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final protecting = snapshot.state.isProtecting;
+    // Read off the *group*, not off this handset. Basing it on the local state
+    // meant a phone that had just disarmed itself offered "Arm all" to a group
+    // that was still guarding — or still alarming.
+    final protecting = snapshot.anyoneGuarding;
     return Row(
       children: [
         Expanded(

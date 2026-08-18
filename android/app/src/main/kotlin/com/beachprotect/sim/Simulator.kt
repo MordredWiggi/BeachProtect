@@ -107,7 +107,7 @@ class Simulator(
             "Phone switched off",
             "A phone simply stops broadcasting while armed, as if it were " +
                 "powered down or dropped in a bag.",
-            30_000, true, 14_000,
+            30_000, true, 16_000,
         ),
         VANISH_LOW_BATTERY(
             "Phone dies at 3 percent",

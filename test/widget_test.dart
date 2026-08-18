@@ -93,6 +93,55 @@ void main() {
       final peer = PeerInfo.fromMap(<Object?, Object?>{'deviceId': 0x0A1F});
       expect(peer.displayName, 'Phone 0A1F');
     });
+
+    /// Staleness is decided natively, where the arrival times are known. The UI
+    /// used to apply its own flat eight second rule, which at a low scan duty
+    /// cycle is shorter than an ordinary gap between two results — so a phone on
+    /// the same towel flickered between "watched" and "no signal" once a second.
+    test('staleness comes from the engine, not from a rule of thumb here', () {
+      final slowButPresent = PeerInfo.fromMap(<Object?, Object?>{
+        'deviceId': 1,
+        'lastSeenMsAgo': 11000,
+        'linkStale': false,
+        'staleAfterMs': 22000,
+      });
+      expect(slowButPresent.stale, isFalse);
+
+      final gone = PeerInfo.fromMap(<Object?, Object?>{
+        'deviceId': 1,
+        'lastSeenMsAgo': 40000,
+        'linkStale': true,
+        'staleAfterMs': 22000,
+      });
+      expect(gone.stale, isTrue);
+    });
+
+    /// "Two of three guarding" has to mean phones we can currently hear. A peer
+    /// whose last beacon said "armed" half a minute ago is not evidence.
+    test('a peer we cannot hear is not counted as guarding', () {
+      final snapshot = GuardSnapshot.fromMap(<Object?, Object?>{
+        'state': 'ARMED',
+        'peers': [
+          <Object?, Object?>{'deviceId': 1, 'armed': true},
+          <Object?, Object?>{'deviceId': 2, 'armed': true, 'linkStale': true},
+        ],
+      });
+      expect(snapshot.armedPeerCount, 1);
+      expect(snapshot.anyoneGuarding, isTrue);
+    });
+
+    /// Whether the group is in an incident is a different question from whether
+    /// this phone is, and conflating them left somebody with a screaming towel
+    /// and an "Arm all" button.
+    test('a group alarm outlives this phone leaving it', () {
+      final snapshot = GuardSnapshot.fromMap(<Object?, Object?>{
+        'state': 'DISARMED',
+        'groupAlarmActive': true,
+      });
+      expect(snapshot.state, GuardState.disarmed);
+      expect(snapshot.groupAlarmActive, isTrue);
+      expect(snapshot.anyoneGuarding, isFalse);
+    });
   });
 
   group('Consensus rule', () {

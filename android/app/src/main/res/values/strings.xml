@@ -13,6 +13,9 @@
     <string name="alarm_subtitle_alarm">The whole group has been alerted</string>
 
     <string name="disarm">DISARM</string>
+    <string name="stop_alarm">STOP THE ALARM</string>
+    <string name="stop_alarm_hint">Silences every phone in the group and keeps them all guarding</string>
+    <string name="disarm_everyone">Stop and disarm everyone</string>
     <string name="enter_pin">Enter the group PIN</string>
     <string name="wrong_pin">Wrong PIN</string>
     <string name="use_biometric">Use fingerprint</string>

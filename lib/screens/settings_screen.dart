@@ -378,7 +378,10 @@ class _DetectionGroupState extends State<_DetectionGroup> {
                   min: 5,
                   max: 60,
                   suffix: 'seconds of silence',
-                  help: 'Catches a phone that is switched off or bagged.',
+                  help: 'Catches a phone that is switched off or bagged. This '
+                      'is a floor: on a low-power scan setting, where gaps '
+                      'between beacons are naturally long, the guard waits '
+                      'proportionally longer before calling a phone gone.',
                   onChanged: (v) =>
                       controller.patch({'lostTimeoutMs': (v * 1000).round()}),
                 ),
