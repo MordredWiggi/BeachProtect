@@ -158,15 +158,16 @@ void main() {
 
     /// The first run is only over when the walkthrough says so.
     ///
-    /// Inferring it from "a group exists" cut the wizard off at step two of
-    /// four - the group is created there - so the PIN and the whole
-    /// permissions walkthrough were never shown at all.
+    /// Inferring it from "a group exists" cut the wizard off half way through,
+    /// because the group used to be created inside it - so the permissions
+    /// walkthrough was never shown at all.
     test('an unfinished first run is not mistaken for a finished one', () {
       final midway = GuardSettings.fromMap(<Object?, Object?>{
         'hasGroup': true,
         'selfName': 'Jan',
       });
       expect(midway.onboardingComplete, isFalse);
+      expect(midway.firstRunDone, isFalse);
 
       final done = GuardSettings.fromMap(<Object?, Object?>{
         'hasGroup': true,
@@ -174,6 +175,33 @@ void main() {
         'onboardingComplete': true,
       });
       expect(done.onboardingComplete, isTrue);
+      expect(done.firstRunDone, isTrue);
+    });
+
+    /// Leaving a group is not a factory reset.
+    ///
+    /// The first run and the group are separate states, and the app has a
+    /// separate screen for each. Someone who leaves a group has still set this
+    /// phone up: they should land on "create or join", not be walked through a
+    /// welcome screen and asked for a name they set weeks ago.
+    test('leaving a group does not undo the first run', () {
+      final noGroup = GuardSettings.fromMap(<Object?, Object?>{
+        'hasGroup': false,
+        'selfName': 'Jan',
+        'onboardingComplete': true,
+      });
+      expect(noGroup.firstRunDone, isTrue);
+      expect(noGroup.hasGroup, isFalse);
+    });
+
+    /// A name is part of the setup, not decoration: without one, a phone
+    /// introduces itself to the group as a hexadecimal id.
+    test('a blank name means the first run is not finished', () {
+      final unnamed = GuardSettings.fromMap(<Object?, Object?>{
+        'onboardingComplete': true,
+        'selfName': '   ',
+      });
+      expect(unnamed.firstRunDone, isFalse);
     });
   });
 }

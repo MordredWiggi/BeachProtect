@@ -120,6 +120,29 @@ class Harness(
     }
 }
 
+/**
+ * Feeds every chunk of [name] in, as the sender would dribble them out.
+ *
+ * Names are carried two characters at a time in the event slot, reusing the
+ * bytes that would otherwise hold telemetry, so this is what a peer introducing
+ * itself actually looks like on the wire.
+ */
+fun sendName(h: Harness, deviceId: Int, name: String, armed: Boolean = true) {
+    for (chunk in 0 until Protocol.NAME_CHUNKS) {
+        val (subjectField, charField) = Protocol.encodeNameChunk(name, chunk)
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(
+                deviceId,
+                armed = armed,
+                eventType = Protocol.EVENT_NAME,
+                subjectId = subjectField,
+                motionScore = charField,
+            ),
+        )
+    }
+}
+
 /** Builds a decoded beacon without going through crypto. */
 fun beacon(
     deviceId: Int,

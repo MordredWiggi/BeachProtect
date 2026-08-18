@@ -75,11 +75,24 @@ class GuardStore(context: Context) {
 
     val groupCode: String? get() = groupSecret?.let { Protocol.encodeGroupCode(it) }
 
+    /**
+     * The advertisement sequence counter deliberately survives all three of
+     * these.
+     *
+     * It used to be reset whenever the group changed, which quietly broke
+     * rejoining: this device's id is derived from the group secret and the
+     * install id, so leaving a group and joining it again comes back as the
+     * *same* device with its counter back at zero. Every phone that still
+     * remembered the old, higher number then treated its "arm everyone" and
+     * "everybody stop" as replays and threw them away — for as long as it
+     * remembered the peer at all. A counter that only ever climbs cannot do
+     * that, and monotonic-for-the-life-of-the-install is a stronger guarantee
+     * than monotonic-per-group anyway.
+     */
     fun createGroup(name: String): String {
         val secret = Protocol.newGroupSecret()
         groupSecret = secret
         groupName = name
-        resetSequence()
         return Protocol.encodeGroupCode(secret)
     }
 
@@ -88,7 +101,6 @@ class GuardStore(context: Context) {
         val secret = Protocol.decodeGroupCode(code) ?: return false
         groupSecret = secret
         groupName = name
-        resetSequence()
         return true
     }
 
@@ -97,7 +109,6 @@ class GuardStore(context: Context) {
         groupName = ""
         armed = false
         peerNames = emptyMap()
-        resetSequence()
     }
 
     // ---- monotonic sequence ---------------------------------------------
@@ -120,8 +131,6 @@ class GuardStore(context: Context) {
 
     /** Size of a reserved block; about an hour of beaconing. */
     val sequenceBlockSize: Int get() = SEQ_BLOCK
-
-    private fun resetSequence() = prefs.edit().putInt(KEY_SEQ, 0).apply()
 
     // ---- disarm authentication -------------------------------------------
 

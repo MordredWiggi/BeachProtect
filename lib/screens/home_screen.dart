@@ -150,7 +150,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ),
             if (snapshot.peers.isEmpty)
-              _EmptyPeers(bluetoothOn: snapshot.diagnostics.bluetoothOn)
+              // Only claim the radio is off when the guard is actually running
+              // and has said so. An empty diagnostics block — no snapshot has
+              // arrived yet — is "we do not know", and announcing "Bluetooth is
+              // off" to somebody whose Bluetooth is plainly on is worse than
+              // saying nothing.
+              _EmptyPeers(
+                bluetoothOff: snapshot.diagnostics.serviceRunning &&
+                    !snapshot.diagnostics.bluetoothOn,
+              )
             else
               for (final peer in snapshot.peers) ...[
                 PeerCard(
@@ -585,17 +593,26 @@ class _QuickActions extends StatelessWidget {
             icon: protecting ? Icons.shield_outlined : Icons.shield_rounded,
             label: protecting ? 'Disarm all' : 'Arm all',
             color: context.status.calibrating,
+            // Said as what it is. The command is broadcast and repeated for
+            // several seconds, but nothing acknowledges it — so claiming the
+            // group is armed would be a promise this phone cannot keep. The
+            // count in the Group header below is the real answer.
             onTap: () async {
               final messenger = ScaffoldMessenger.of(context);
               if (protecting) {
                 await controller.disarmGroup();
                 messenger.showSnackBar(
-                  const SnackBar(content: Text('Whole group disarmed.')),
+                  const SnackBar(
+                    content: Text('Telling everyone to stand down.'),
+                  ),
                 );
               } else {
                 await controller.armGroup();
                 messenger.showSnackBar(
-                  const SnackBar(content: Text('Whole group armed.')),
+                  const SnackBar(
+                    content: Text('Telling everyone to arm. Watch the count '
+                        'under Group.'),
+                  ),
                 );
               }
             },
@@ -676,9 +693,10 @@ class _ActionTile extends StatelessWidget {
 }
 
 class _EmptyPeers extends StatelessWidget {
-  const _EmptyPeers({required this.bluetoothOn});
+  const _EmptyPeers({required this.bluetoothOff});
 
-  final bool bluetoothOn;
+  /// Known to be off, as opposed to merely not confirmed to be on.
+  final bool bluetoothOff;
 
   @override
   Widget build(BuildContext context) {
@@ -688,24 +706,24 @@ class _EmptyPeers extends StatelessWidget {
         child: Column(
           children: [
             Icon(
-              bluetoothOn ? Icons.wifi_tethering_rounded : Icons.bluetooth_disabled_rounded,
+              bluetoothOff
+                  ? Icons.bluetooth_disabled_rounded
+                  : Icons.wifi_tethering_rounded,
               size: 30,
               color: context.colors.onSurface.withValues(alpha: 0.4),
             ),
             const SizedBox(height: 10),
             Text(
-              bluetoothOn
-                  ? 'Looking for the others'
-                  : 'Bluetooth is off',
+              bluetoothOff ? 'Bluetooth is off' : 'Looking for the others',
               style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 6),
             Text(
-              bluetoothOn
-                  ? 'Everyone needs BeachProtect open once, in the same group. '
-                      'They appear here within a few seconds.'
-                  : 'The whole thing runs on Bluetooth, so nothing works until '
-                      'it is switched on.',
+              bluetoothOff
+                  ? 'The whole thing runs on Bluetooth, so nothing works until '
+                      'it is switched on.'
+                  : 'Everyone needs BeachProtect open once, in the same group. '
+                      'They appear here within a few seconds.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 13,

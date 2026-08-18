@@ -182,8 +182,12 @@ class GuardBridge(private val context: Context, messenger: BinaryMessenger) {
             // ---- device / system -------------------------------------------
             "bluetoothEnabled" -> result.success(adapter?.state == BluetoothAdapter.STATE_ON)
 
+            // The same test BleAdvertiser uses. Deliberately not
+            // isMultipleAdvertisementSupported: that answers whether *several*
+            // advertising sets can run at once, and we only ever run one -
+            // several perfectly capable phones report false for it.
             "advertisingSupported" -> result.success(
-                adapter?.isMultipleAdvertisementSupported == true,
+                adapter?.bluetoothLeAdvertiser != null,
             )
 
             "requestEnableBluetooth" -> {

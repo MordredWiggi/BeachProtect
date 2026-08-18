@@ -74,8 +74,18 @@ class ThreatEngine(
     /** subject id -> observer id -> vote. Our own votes live in here too. */
     private val votes = HashMap<Int, HashMap<Int, VoteRecord>>()
 
-    /** Last control-event sequence number accepted from each sender. */
-    private val lastControlSeq = HashMap<Int, Int>()
+    /**
+     * Highest sequence number heard from each sender, control event or not.
+     *
+     * Tracked on every beacon rather than only on control ones. Sequence
+     * numbers are handed out in blocks of a few thousand and a fresh block is
+     * burned on every app start, so a device that had been quiet for a while
+     * could come back with a number far enough ahead that the wraparound
+     * comparison read it as *older* — and its "everybody stop" would be
+     * discarded as a replay. Following every beacon keeps the reference close
+     * to the sender's real position.
+     */
+    private val lastSeq = HashMap<Int, Int>()
 
     private var armedSince = 0L
     private var pendingSince = 0L
@@ -91,6 +101,36 @@ class ThreatEngine(
 
     var alarmSubject = Protocol.DEVICE_ID_NONE
         private set
+
+    /**
+     * Whether the alarm currently sounding was decided *here*.
+     *
+     * Only the phone that made the decision keeps `EVENT_ALARM` on the air. A
+     * phone that is merely joining in does not re-broadcast it, and that is not
+     * a detail: while every alarming phone repeated the event, two phones
+     * sustained each other indefinitely. Clearing one made it fall silent for a
+     * fraction of a second, hear the other's still-repeating alarm, and start
+     * again — which the other then heard, and so on. Neither phone could ever
+     * be stood down, closing the app did not help (an alarm in progress defers
+     * the shutdown, §6b), and the only way out was for everyone to leave the
+     * group. With a single source per incident, silencing that source ends it.
+     */
+    var alarmOriginatedHere: Boolean = false
+        private set
+
+    /**
+     * Until when alarm events arriving from peers are ignored.
+     *
+     * A group-wide "stop" cannot land on every phone in the same millisecond,
+     * so for a few seconds afterwards the air still carries alarm packets from
+     * the incident that was just called off. Without this window the first
+     * phone to obey the command would immediately be re-triggered by the last
+     * phone to hear it. Local detection is untouched: a phone that is picked up
+     * during the window still alarms, because that is new evidence rather than
+     * an echo.
+     */
+    private var alarmSuppressedUntil = 0L
+
     private var lastEvidenceAt = 0L
     private var radioProfile = RadioProfile.CALM
     private var warnings = emptySet<GuardWarning>()
@@ -149,15 +189,27 @@ class ThreatEngine(
         boxBaseline.clear()
         votes.clear()
         boxAlarmFired = false
+        // Arming is a deliberate fresh start, so whatever was being ignored
+        // from the last incident stops being ignored.
+        alarmSuppressedUntil = 0L
         endMotionEpisode()
         transition(now, GuardState.CALIBRATING)
     }
 
-    fun disarm(now: Long) {
+    /**
+     * @param groupWide true when this is standing the *whole group* down, which
+     *        also has to ignore the incident's remaining packets for a moment.
+     *        A plain local disarm does not: switching your own phone off guard
+     *        must not stop it hearing that somebody else's is being taken.
+     */
+    fun disarm(now: Long, groupWide: Boolean = false) {
+        val wasAnnouncing = state == GuardState.ALARM || state == GuardState.PENDING
         if (state == GuardState.ALARM) {
             listener.onAlarmCleared()
         }
+        if (groupWide || wasAnnouncing) suppressRelayedAlarms(now)
         alarmReason = null
+        alarmOriginatedHere = false
         alarmSubject = Protocol.DEVICE_ID_NONE
         alarmSince = 0L
         pendingSince = 0L
@@ -173,7 +225,9 @@ class ThreatEngine(
     fun clearAlarm(now: Long) {
         if (state != GuardState.ALARM && state != GuardState.PENDING) return
         listener.onAlarmCleared()
+        suppressRelayedAlarms(now)
         alarmReason = null
+        alarmOriginatedHere = false
         alarmSubject = Protocol.DEVICE_ID_NONE
         alarmSince = 0L
         pendingSince = 0L
@@ -189,7 +243,22 @@ class ThreatEngine(
     }
 
     fun panic(now: Long) {
+        // A human pressing the button is never an echo of anything.
+        alarmSuppressedUntil = 0L
         raiseAlarm(now, AlarmReason.PANIC, selfDeviceId)
+    }
+
+    /**
+     * Starts the window in which alarm events from peers are treated as echoes
+     * of the incident that has just been called off rather than as news.
+     *
+     * Long enough to cover the group command being repeated to every phone (see
+     * `BeaconComposer.CONTROL_REPEAT_MS`) plus the slowest scan duty cycle, and
+     * no longer: it is deliberately bounded, so a real theft moments after a
+     * false alarm is still heard.
+     */
+    private fun suppressRelayedAlarms(now: Long) {
+        alarmSuppressedUntil = now + ALARM_ECHO_WINDOW_MS
     }
 
     /** Used by the simulator and the in-app self test. */
@@ -220,7 +289,7 @@ class ThreatEngine(
         peers.remove(deviceId)
         votes.remove(deviceId)
         votes.values.forEach { it.remove(deviceId) }
-        lastControlSeq.remove(deviceId)
+        lastSeq.remove(deviceId)
         nameAssembler.forget(deviceId)
     }
 
@@ -232,7 +301,7 @@ class ThreatEngine(
     fun onPeerBeacon(now: Long, rssi: Int, beacon: Beacon) {
         if (beacon.deviceId == selfDeviceId) return
 
-        val peer = peers.getOrPut(beacon.deviceId) { PeerRecord(beacon.deviceId) }
+        val peer = peers.getOrPut(beacon.deviceId) { PeerRecord(beacon.deviceId, now) }
         // How long the filter has been flying blind. Scan results arrive every
         // five seconds or so while calm and several times a second once the
         // radios escalate, and the filter has to be told which it is getting.
@@ -269,6 +338,7 @@ class ThreatEngine(
         }
 
         handleIncomingEvent(now, beacon)
+        rememberSeq(beacon)
     }
 
     fun onSelfMotion(now: Long, signal: MotionSignal) {
@@ -413,7 +483,7 @@ class ThreatEngine(
         }
 
         recomputeWarnings(now)
-        updateRadioProfile()
+        updateRadioProfile(now)
     }
 
     // ---- observer side ---------------------------------------------------
@@ -689,33 +759,47 @@ class ThreatEngine(
 
             Protocol.EVENT_ALARM -> {
                 if (!acceptControl(beacon)) return
+                if (now < alarmSuppressedUntil) return
                 if (state != GuardState.ALARM) {
-                    raiseAlarm(now, AlarmReason.RELAYED, beacon.subjectId)
+                    raiseAlarm(now, AlarmReason.RELAYED, beacon.subjectId, originatedHere = false)
                 }
             }
 
             Protocol.EVENT_BOX_ALARM -> {
                 if (!acceptControl(beacon)) return
+                if (now < alarmSuppressedUntil) return
                 if (state != GuardState.ALARM) {
-                    raiseAlarm(now, AlarmReason.BOX_TAKEN, Protocol.DEVICE_ID_NONE)
+                    raiseAlarm(
+                        now, AlarmReason.BOX_TAKEN, Protocol.DEVICE_ID_NONE,
+                        originatedHere = false,
+                    )
                 }
             }
 
+            // Deliberately not gated on the echo window. A panic is somebody's
+            // thumb on a button, so it is news by definition - and since a
+            // relaying phone no longer repeats alarms, the only thing that can
+            // put this event on the air is the phone whose button was pressed.
             Protocol.EVENT_PANIC -> {
                 if (!acceptControl(beacon)) return
                 if (state != GuardState.ALARM) {
-                    raiseAlarm(now, AlarmReason.PANIC, beacon.subjectId)
+                    raiseAlarm(now, AlarmReason.PANIC, beacon.subjectId, originatedHere = false)
                 }
             }
 
+            // Both of these start the echo window even when there is nothing to
+            // clear here: the point is to stop the packets still in the air
+            // from the cancelled incident from starting this phone up.
             Protocol.EVENT_ALARM_CLEAR -> {
                 if (!acceptControl(beacon)) return
+                suppressRelayedAlarms(now)
                 if (state == GuardState.ALARM || state == GuardState.PENDING) clearAlarm(now)
             }
 
             Protocol.EVENT_DISARM_ALL -> {
                 if (!acceptControl(beacon)) return
-                if (state != GuardState.DISARMED) disarm(now)
+                suppressRelayedAlarms(now)
+                if (state != GuardState.DISARMED) disarm(now, groupWide = true)
             }
 
             Protocol.EVENT_ARM_ALL -> {
@@ -734,22 +818,41 @@ class ThreatEngine(
      * replay it the next afternoon.
      */
     private fun acceptControl(beacon: Beacon): Boolean {
-        val last = lastControlSeq[beacon.deviceId]
-        if (last != null && !isNewerSeq(beacon.seq, last)) return false
-        lastControlSeq[beacon.deviceId] = beacon.seq
-        return true
+        val last = lastSeq[beacon.deviceId] ?: return true
+        return isNewerSeq(beacon.seq, last)
+    }
+
+    /** Advances the replay reference. Called for every authenticated beacon. */
+    private fun rememberSeq(beacon: Beacon) {
+        val last = lastSeq[beacon.deviceId]
+        if (last == null || isNewerSeq(beacon.seq, last)) {
+            lastSeq[beacon.deviceId] = beacon.seq
+        }
     }
 
     // ---- transitions ------------------------------------------------------
 
-    private fun raiseAlarm(now: Long, reason: AlarmReason, subjectId: Int) {
+    /**
+     * @param originatedHere false when we are only joining in an alarm another
+     *        phone decided on. Such an alarm makes just as much noise, but it
+     *        is not put back on the air - exactly one phone speaks for each
+     *        incident, so silencing that phone ends it for everybody.
+     */
+    private fun raiseAlarm(
+        now: Long,
+        reason: AlarmReason,
+        subjectId: Int,
+        originatedHere: Boolean = true,
+    ) {
         if (state == GuardState.ALARM) return
         alarmReason = reason
+        alarmOriginatedHere = originatedHere
         alarmSubject = subjectId
         alarmSince = now
         pendingSince = 0L
         transition(now, GuardState.ALARM)
         listener.onAlarmRaised(reason, subjectId)
+        if (!originatedHere) return
         val event = if (reason == AlarmReason.BOX_TAKEN) {
             Protocol.EVENT_BOX_ALARM
         } else {
@@ -776,17 +879,39 @@ class ThreatEngine(
         listener.onStateChanged(previous, next)
     }
 
-    private fun updateRadioProfile() {
-        val next = when (state) {
+    private fun updateRadioProfile(now: Long) {
+        var next = when (state) {
             GuardState.ALARM -> RadioProfile.CRITICAL
             GuardState.SUSPICIOUS, GuardState.PENDING -> RadioProfile.ALERT
             GuardState.CALIBRATING -> RadioProfile.ALERT
             GuardState.ARMED, GuardState.DISARMED -> RadioProfile.CALM
         }
+        if (next == RadioProfile.CALM && awaitingIntroduction(now)) next = RadioProfile.ALERT
         if (next != radioProfile) {
             radioProfile = next
             listener.onRadioProfileChanged(next)
         }
+    }
+
+    /**
+     * True for a short while after meeting a phone whose name we do not know.
+     *
+     * Names travel two characters at a time in the beacon's idle event slot, so
+     * six different packets have to be caught before one can be read. At the
+     * calm duty cycle - a 512 ms scan window every 5.12 s against a beacon sent
+     * once a second - a phone catches roughly one packet every five seconds, of
+     * a rotation of six: a full name takes well over a minute of both phones
+     * lying perfectly still, and in practice the group list simply showed
+     * hexadecimal ids forever.
+     *
+     * So meeting somebody new is worth a few seconds of fast radio. Both ends
+     * do this simultaneously - each is new to the other - which also speeds the
+     * advertisement up, and the name arrives in a couple of seconds. The window
+     * is anchored to when the peer was first heard, so a phone whose owner
+     * never set a name costs this once and not repeatedly.
+     */
+    private fun awaitingIntroduction(now: Long): Boolean = peers.values.any {
+        it.name == null && now - it.firstSeenAt < PEER_INTRODUCTION_MS
     }
 
     // ---- warnings ---------------------------------------------------------
@@ -906,10 +1031,28 @@ class ThreatEngine(
 
     fun selfMotionScoreForBeacon(): Int = selfMotionScore
 
-    /** True while it is safe to spend an event slot on a name chunk. */
-    fun canBroadcastName(now: Long): Boolean =
-        (state == GuardState.DISARMED || state == GuardState.ARMED) &&
-            selfStationary && activeVotes(now).isEmpty()
+    /**
+     * True while it is safe to spend an event slot on a name chunk.
+     *
+     * A name packet reuses the telemetry bytes, so it carries no fresh motion
+     * score - which is why an armed phone only sends one while it is lying
+     * still. A *disarmed* phone has no such duty: nobody is guarding it, so
+     * nothing is reading its motion score at all.
+     *
+     * That distinction is the difference between names working and not. People
+     * are holding their phones when they set a group up - reading the screen,
+     * typing a code - and requiring stillness meant neither phone said a word
+     * about who it was during the one minute both of them were listening
+     * hardest. Everyone put their phone down on the towel already anonymous.
+     */
+    fun canBroadcastName(now: Long): Boolean {
+        val slotFree = when (state) {
+            GuardState.DISARMED -> true
+            GuardState.ARMED -> selfStationary
+            else -> false
+        }
+        return slotFree && activeVotes(now).isEmpty()
+    }
 
     companion object {
         /** Sentinel for "this has not happened yet". */
@@ -928,6 +1071,16 @@ class ThreatEngine(
         /** Peers unheard for this long are dropped from the UI entirely. */
         const val PEER_FORGET_MS = 5 * 60_000L
 
+        /** How long a newly met phone gets fast radio to introduce itself. */
+        const val PEER_INTRODUCTION_MS = 25_000L
+
+        /**
+         * How long alarm events from peers are treated as echoes after a
+         * group-wide stop. Comfortably longer than the command is repeated for,
+         * so the last phone to obey cannot re-trigger the first.
+         */
+        const val ALARM_ECHO_WINDOW_MS = 15_000L
+
         /** Box BLE beacons older than this stop counting as "tracked". */
         const val BOX_BLE_STALE_MS = 20_000L
 
@@ -944,7 +1097,7 @@ class ThreatEngine(
 
 private data class VoteRecord(val type: VoteType, val atMs: Long)
 
-private class PeerRecord(val deviceId: Int) {
+private class PeerRecord(val deviceId: Int, val firstSeenAt: Long) {
     val kalman = RssiKalman()
     val baselineWindow = RollingMedian(48)
     val trend = TrendEstimator(16)

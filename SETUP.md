@@ -334,17 +334,28 @@ walk away with one while still collecting logs.
 
 ### Setting the group up across phones
 
-1. On the first phone: onboarding ▸ **Create**.
-2. On the others: onboarding ▸ **Join** ▸ scan the QR from phone one, or type
-   its 16-character code.
-3. Use the **same group PIN** everywhere — that is what lets any of you silence
-   a false alarm on anyone's phone.
+On a fresh install every phone first walks through **your name** and **the
+permissions Android needs** — once, and never again. It then lands on the group
+screen, which is also where a phone goes whenever it has no group.
+
+1. On the first phone: **Create**.
+2. On the others: **Join** ▸ scan the QR from phone one, or type its
+   16-character code.
+3. In **Settings ▸ Disarming**, set the **same group PIN** everywhere — that is
+   what lets any of you silence a false alarm on anyone's phone. Without one,
+   a phone falls back to its fingerprint reader, or to a single tap.
 4. Leave the app open on every phone. Backgrounded and screen off is fine;
    swiped out of Recents stops that phone's guard entirely.
 
 Within about ten seconds each phone should list the others under **Group**, and
 the `group beacons` chip at the bottom of the home screen should be counting up.
 Neither phone has to be armed for that.
+
+Names take a few seconds longer than the phones themselves do: they are dripped
+out two characters at a time in the beacon's spare bytes, and a phone runs its
+radio fast for the first 25 seconds after meeting somebody new specifically so
+this does not take a minute. Until a name arrives the others show a hexadecimal
+id, and you can always override one locally by tapping it.
 
 ---
 

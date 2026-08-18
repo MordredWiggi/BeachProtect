@@ -69,9 +69,12 @@ Quick version, from the repository root in PowerShell:
 ## Using it on the beach
 
 1. **One person creates a group.** Everyone else scans the QR or types the
-   16-character code.
-2. **Agree on a group PIN.** Anyone who knows it can silence any phone's alarm,
-   which is what you want when someone forgets to disarm.
+   16-character code. On a new phone this comes straight after the one-off
+   setup — your name, and the permissions Android needs — and it is where the
+   app waits any time it has no group.
+2. **Agree on a group PIN** (Settings ▸ Disarming). Anyone who knows it can
+   silence any phone's alarm, which is what you want when someone forgets to
+   disarm.
 3. **Lay everything out**, then tap the shield — or **Arm all** to arm the whole
    group at once.
 4. Wait a few seconds for "Guarding". The app is learning how strong each
@@ -98,7 +101,7 @@ With more phones:
 A guided eight-step field protocol with synchronised log capture from every
 device.
 
-Automated suites — 58 Kotlin tests on the detection engine, 9 Dart tests on
+Automated suites — 69 Kotlin tests on the detection engine, 11 Dart tests on
 snapshot decoding:
 
 ```powershell

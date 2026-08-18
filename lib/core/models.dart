@@ -662,6 +662,15 @@ class GuardSettings {
     alarmOnPickupAlone: true,
   );
 
+  /// Whether the one-off setup of *this phone* is finished.
+  ///
+  /// Deliberately says nothing about groups. Setting the phone up — who you
+  /// are, and what Android has to allow — happens once in the life of the
+  /// install; belonging to a group is a state the app moves in and out of all
+  /// afternoon. Conflating the two sent someone who left a group back through
+  /// a welcome screen asking for a name that was already set.
+  bool get firstRunDone => onboardingComplete && selfName.trim().isNotEmpty;
+
   /// Mirrors `EngineConfig.observersRequiredFor` so the UI can explain the rule
   /// with the group's actual size rather than an abstract percentage.
   int observersRequiredFor(int otherPhones) {

@@ -62,18 +62,31 @@ class GuardController extends ChangeNotifier {
 
   GuardBridge get bridge => _bridge;
 
-  /// The first run is only over once the walkthrough has been seen through to
-  /// the end — not merely once a group exists, which is only step two of four.
-  bool get needsSetup =>
-      !_settings.hasGroup ||
-      _settings.selfName.trim().isEmpty ||
-      !_settings.onboardingComplete;
+  /// Whether the one-off first run still has to happen.
+  ///
+  /// Deliberately says nothing about groups. Setting this phone up — who you
+  /// are, and what Android has to allow — happens once in the life of the
+  /// install. Belonging to a group is a different kind of thing entirely:
+  /// people leave one group and join another all afternoon, and being marched
+  /// back through a welcome screen to retype a name that is already set every
+  /// time is nonsense. [needsGroup] handles that separately.
+  ///
+  /// Completion is recorded natively at the end of the last step rather than
+  /// inferred from anything, so an interrupted first run resumes rather than
+  /// counting as done.
+  bool get needsOnboarding => !_settings.firstRunDone;
+
+  /// No group yet — the app's default screen until one is created or joined.
+  bool get needsGroup => !_settings.hasGroup;
 
   Future<void> completeOnboarding() => patch({'onboardingComplete': true});
 
   Future<void> initialise() async {
     _loading = true;
     notifyListeners();
+    // Before anything that can throw: a failed settings read must not leave the
+    // app with no way to hear from the guard.
+    _listen();
     try {
       _settings = await _bridge.getSettings();
       if (_settings.hasGroup) {
@@ -81,7 +94,6 @@ class GuardController extends ChangeNotifier {
         final initial = await _bridge.getSnapshot();
         if (initial != null) _snapshot = initial;
       }
-      _listen();
       await refreshPermissions();
       _error = null;
     } catch (e) {
@@ -92,8 +104,16 @@ class GuardController extends ChangeNotifier {
     }
   }
 
+  /// Subscribes once and stays subscribed.
+  ///
+  /// Deliberately idempotent. Re-subscribing tears the platform stream down and
+  /// builds it back up, and the native side takes the teardown as "the UI has
+  /// gone away" and drops its snapshot listener — so a badly timed round trip
+  /// leaves a live subscription wired to nothing and a screen that never
+  /// updates again. The subscription survives groups being left and joined; it
+  /// belongs to the app being open, not to the guard being configured.
   void _listen() {
-    _subscription?.cancel();
+    if (_subscription != null) return;
     _subscription = _bridge.snapshots.listen(
       (snapshot) {
         _snapshot = snapshot;
@@ -152,7 +172,6 @@ class GuardController extends ChangeNotifier {
     );
     await _bridge.startService();
     await refreshSettings();
-    _listen();
     return code;
   }
 
@@ -169,7 +188,6 @@ class GuardController extends ChangeNotifier {
     if (ok) {
       await _bridge.startService();
       await refreshSettings();
-      _listen();
     }
     return ok;
   }

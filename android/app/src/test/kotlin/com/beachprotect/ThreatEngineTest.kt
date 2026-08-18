@@ -7,6 +7,7 @@ import com.beachprotect.guard.EngineConfig
 import com.beachprotect.guard.GuardState
 import com.beachprotect.guard.GuardWarning
 import com.beachprotect.guard.MotionSignal
+import com.beachprotect.guard.RadioProfile
 import com.beachprotect.guard.ThreatEngine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -709,6 +710,303 @@ class ThreatEngineTest {
         assertNotEquals(
             "a replayed disarm must not stand the guard down",
             GuardState.DISARMED, h.engine.state,
+        )
+    }
+
+    /**
+     * The two-phone deadlock, in the smallest form that reproduces it.
+     *
+     * Both phones alarmed, and every alarming phone repeated `EVENT_ALARM`
+     * continuously. Silencing one made it fall quiet for a fraction of a
+     * second, hear the other still repeating, and start again - which the other
+     * then heard. Neither phone could be stood down at all: closing the app did
+     * not help, because an alarm in progress defers the shutdown, and the only
+     * way out of it was for everybody to leave the group.
+     */
+    @Test
+    fun `a cleared alarm is not restarted by the phone still alarming`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        var seq = 10
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = seq, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        assertEquals(GuardState.ALARM, h.engine.state)
+
+        // The owner silences this phone. The other one has not heard yet and
+        // keeps shouting about the same incident.
+        h.engine.clearAlarm(h.now)
+        assertNotEquals(GuardState.ALARM, h.engine.state)
+
+        h.advance(6_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(
+                t, -60,
+                beacon(
+                    PEER_A, seq = ++seq,
+                    eventType = Protocol.EVENT_ALARM, subjectId = PEER_B,
+                ),
+            )
+        }
+
+        assertNotEquals(
+            "packets from the incident just called off must not restart it",
+            GuardState.ALARM, h.engine.state,
+        )
+        assertEquals("and the siren must have run exactly once", 1, h.recorder.alarms.size)
+    }
+
+    /**
+     * Switching your own phone off guard must not stop it hearing that
+     * somebody else's is being taken. Only a group-wide stop ignores the
+     * incident's remaining packets, because only a group-wide stop is about
+     * an incident.
+     */
+    @Test
+    fun `an ordinary local disarm does not deafen this phone to the group`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.disarm(h.now)
+        h.advance(1_000)
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 50, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        assertEquals(GuardState.ALARM, h.engine.state)
+    }
+
+    /** ...but the silence is a bounded window, not a permanent deafness. */
+    @Test
+    fun `a genuinely new alarm is heard once the echo window has passed`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 10, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        h.engine.clearAlarm(h.now)
+        h.advance(ThreatEngine.ALARM_ECHO_WINDOW_MS + 2_000, stepMs = 1_000) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A))
+        }
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 200, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        assertEquals(GuardState.ALARM, h.engine.state)
+    }
+
+    /**
+     * Exactly one phone speaks for each incident.
+     *
+     * A phone joining in makes just as much noise, but putting the alarm back
+     * on the air is what gave every incident as many sources as there were
+     * phones - and every one of them had to be silenced separately before any
+     * of them would stay silenced.
+     */
+    @Test
+    fun `joining somebody else's alarm does not put it back on the air`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 7, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+
+        assertTrue("it must still sound off", h.recorder.alarmed)
+        assertEquals(AlarmReason.RELAYED, h.recorder.firstReason)
+        assertFalse("but it must not become a second source", h.engine.alarmOriginatedHere)
+        assertTrue(
+            "and must broadcast nothing at all",
+            h.recorder.broadcasts.none { it.first == Protocol.EVENT_ALARM },
+        )
+    }
+
+    @Test
+    fun `a phone that decides on the alarm itself does broadcast it`() {
+        val h = Harness()
+        h.armAndSettle()
+
+        h.engine.onSelfMotion(h.now, MotionSignal.Level(200, stationary = false))
+        h.advance(6_000, stepMs = 500) { t ->
+            h.engine.onSelfMotion(t, MotionSignal.Level(200, stationary = false))
+        }
+
+        assertTrue(h.recorder.alarmed)
+        assertTrue(h.engine.alarmOriginatedHere)
+        assertTrue(
+            h.recorder.broadcasts.any { it.first == Protocol.EVENT_ALARM },
+        )
+    }
+
+    @Test
+    fun `disarm all stands the phone down and keeps it down`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 10, eventType = Protocol.EVENT_ALARM, subjectId = PEER_B),
+        )
+        assertEquals(GuardState.ALARM, h.engine.state)
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 11, eventType = Protocol.EVENT_DISARM_ALL),
+        )
+        assertEquals(GuardState.DISARMED, h.engine.state)
+
+        // The phone that has not caught up yet is still shouting.
+        var seq = 11
+        h.advance(6_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(
+                t, -60,
+                beacon(
+                    PEER_A, seq = ++seq,
+                    eventType = Protocol.EVENT_ALARM, subjectId = PEER_B,
+                ),
+            )
+        }
+        assertEquals(GuardState.DISARMED, h.engine.state)
+    }
+
+    /**
+     * A thumb on the panic button is news, never an echo - and since a relaying
+     * phone no longer repeats alarms, nothing else can put this event on the
+     * air. It is therefore deliberately exempt from the echo window.
+     */
+    @Test
+    fun `a panic still gets through immediately after a group disarm`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 30, eventType = Protocol.EVENT_DISARM_ALL),
+        )
+        assertEquals(GuardState.DISARMED, h.engine.state)
+
+        h.advance(1_000)
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 31, eventType = Protocol.EVENT_PANIC, subjectId = PEER_A),
+        )
+
+        assertEquals(GuardState.ALARM, h.engine.state)
+        assertEquals(AlarmReason.PANIC, h.recorder.alarms.last().first)
+    }
+
+    /**
+     * Rejoining a group must not look like a replay attack.
+     *
+     * The replay reference used to be updated only when a control event
+     * arrived, so it could sit thousands of packets behind the sender's real
+     * position - far enough for the wraparound comparison to read a genuinely
+     * newer number as older, and throw the command away.
+     */
+    @Test
+    fun `a sender that has run far ahead is still obeyed`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = 100, eventType = Protocol.EVENT_ALARM_CLEAR),
+        )
+
+        // Hours of ordinary beacons: twenty thousand sequence numbers, which is
+        // past the half range where the wraparound comparison flips over and
+        // starts reading newer as older.
+        var seq = 100
+        h.advance(20_000, stepMs = 1_000) { t ->
+            seq = (seq + 2_000) and 0xFFFF
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, seq = seq))
+        }
+
+        seq = (seq + 1) and 0xFFFF
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            beacon(PEER_A, seq = seq, eventType = Protocol.EVENT_DISARM_ALL),
+        )
+        assertEquals(GuardState.DISARMED, h.engine.state)
+    }
+
+    // =====================================================================
+    // Names
+    // =====================================================================
+
+    /**
+     * Names travel two characters at a time in the beacon's idle event slot, so
+     * six separate packets have to be caught before one can be read. At the
+     * calm duty cycle that is well over a minute of both phones lying still,
+     * and in the field the group list simply showed hexadecimal ids forever.
+     * Meeting somebody new is therefore worth a few seconds of fast radio.
+     */
+    @Test
+    fun `meeting a phone with no name yet speeds the radio up`() {
+        val h = Harness()
+        h.settle()
+
+        h.engine.onPeerBeacon(h.now, -60, beacon(PEER_A, armed = false))
+        h.advance(2_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, armed = false))
+        }
+        assertEquals(RadioProfile.ALERT, h.recorder.profile)
+
+        sendName(h, PEER_A, "Lisa", armed = false)
+        h.advance(1_000)
+
+        assertEquals("Lisa", h.engine.snapshot(h.now).peers.single().name)
+        assertEquals(
+            "and drops straight back once we know who they are",
+            RadioProfile.CALM, h.recorder.profile,
+        )
+    }
+
+    @Test
+    fun `a phone that never sends a name does not hold the radio up forever`() {
+        val h = Harness()
+        h.settle()
+
+        h.advance(ThreatEngine.PEER_INTRODUCTION_MS + 3_000, stepMs = 1_000) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, armed = false))
+        }
+
+        assertEquals(RadioProfile.CALM, h.recorder.profile)
+    }
+
+    /**
+     * People are holding their phones when they set a group up. Requiring
+     * stillness to send a name meant neither phone said a word about who it was
+     * during the one minute both of them were listening hardest.
+     */
+    @Test
+    fun `a disarmed phone introduces itself even while it is being handled`() {
+        val h = Harness()
+        h.engine.onSelfMotion(h.now, MotionSignal.Level(200, stationary = false))
+
+        assertTrue(
+            "nobody is guarding a disarmed phone, so the slot is free",
+            h.engine.canBroadcastName(h.now),
+        )
+
+        // Armed and still being nudged about, but too gently to be a pickup:
+        // the phone is guarding, so its watchers are entitled to a fresh motion
+        // score in every packet and the slot is not ours to spend.
+        h.settle()
+        h.engine.arm(h.now)
+        h.advance(12_000, stepMs = 500)
+        h.engine.onSelfMotion(h.now, MotionSignal.Level(10, stationary = false))
+
+        assertEquals(GuardState.ARMED, h.engine.state)
+        assertFalse(
+            "an armed phone still owes its watchers a fresh motion score",
+            h.engine.canBroadcastName(h.now),
         )
     }
 

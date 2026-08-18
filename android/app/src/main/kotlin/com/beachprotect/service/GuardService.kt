@@ -91,6 +91,17 @@ class GuardService : Service(),
     private var wakeLock: PowerManager.WakeLock? = null
 
     private var radioProfile = RadioProfile.CALM
+
+    /**
+     * True while a group command is being repeated onto the air.
+     *
+     * The radios are lifted out of the calm profile for the duration, because
+     * the phone that has to *hear* the command is the one thing the sender
+     * cannot speed up: at the calm advertising interval of one second, a
+     * listener sampling for half a second every five would catch roughly one
+     * packet of the whole announcement.
+     */
+    private var announcing = false
     private var tickScheduled = false
     private var lastNotificationAt = 0L
     private var lastBatteryReadAt = 0L
@@ -165,37 +176,44 @@ class GuardService : Service(),
 
             GuardIntents.ACTION_ARM -> {
                 ensureStarted()
-                store.armed = true
                 engine.arm(now())
+                store.armed = true
             }
 
             GuardIntents.ACTION_DISARM -> {
                 ensureStarted()
                 // If we were making noise, this is the owner saying "that was
                 // me" - so the rest of the group is told to stand down too.
+                //
+                // Only from ALARM. A phone still in its grace period has told
+                // the group nothing yet, so there is nothing to call off - and
+                // calling off an incident that never happened would start the
+                // echo window on every phone in the group for no reason.
                 if (engine.state == GuardState.ALARM) {
                     composer.queueControl(now(), Protocol.EVENT_ALARM_CLEAR, store.deviceId)
                 }
-                store.armed = false
                 engine.disarm(now())
+                store.armed = false
             }
 
             GuardIntents.ACTION_CLEAR_ALARM -> {
+                ensureStarted()
                 composer.queueControl(now(), Protocol.EVENT_ALARM_CLEAR, store.deviceId)
                 engine.clearAlarm(now())
             }
 
             GuardIntents.ACTION_DISARM_GROUP -> {
+                ensureStarted()
                 composer.queueControl(now(), Protocol.EVENT_DISARM_ALL, store.deviceId)
+                engine.disarm(now(), groupWide = true)
                 store.armed = false
-                engine.disarm(now())
             }
 
             GuardIntents.ACTION_ARM_GROUP -> {
                 ensureStarted()
                 composer.queueControl(now(), Protocol.EVENT_ARM_ALL, store.deviceId)
-                store.armed = true
                 engine.arm(now())
+                store.armed = true
             }
 
             GuardIntents.ACTION_PANIC -> {
@@ -215,11 +233,14 @@ class GuardService : Service(),
                 val name = intent.getStringExtra(GuardIntents.EXTRA_SCENARIO)
                 val scenario = runCatching { Simulator.Scenario.valueOf(name ?: "") }.getOrNull()
                 if (scenario != null) {
-                    // Arm the engine but deliberately not the persisted flag:
-                    // a rehearsal must not leave the phone armed afterwards,
-                    // and stopSimulation() uses store.armed to know that.
-                    if (engine.state == GuardState.DISARMED) engine.arm(now())
+                    // Simulator first, engine second. Arming the engine raises
+                    // a state change, and the handler for that syncs the
+                    // persisted armed flag unless a rehearsal is in progress -
+                    // so the rehearsal has to be in progress by then. A
+                    // rehearsal must not leave the phone armed afterwards, and
+                    // stopSimulation() reads store.armed to know that.
                     simulator.start(scenario, now())
+                    if (engine.state == GuardState.DISARMED) engine.arm(now())
                 }
             }
 
@@ -325,8 +346,17 @@ class GuardService : Service(),
         alarmPlayer.release()
         releaseWakeLock()
         runCatching { unregisterReceiver(systemReceiver) }
+        // One last snapshot, so an app that is still on screen shows a stopped
+        // guard rather than freezing on the last thing it happened to see.
+        publishSnapshot()
         instance = null
-        snapshotListener = null
+        // Deliberately *not* clearing snapshotListener. It belongs to the
+        // Flutter bridge, which sets it when the UI subscribes and drops it
+        // when the UI goes away. Clearing it here left a live subscription
+        // wired to nothing: leaving a group stops the service, and every
+        // screen the user opened afterwards - including the new group's -
+        // showed stale, empty state until the app was restarted. That is what
+        // "it said Bluetooth was off until I restarted" was.
         stopForegroundCompat()
         // Belt and braces. STOP_FOREGROUND_REMOVE takes the ongoing one away,
         // but an alarm notification posted on the high-importance channel is a
@@ -422,9 +452,18 @@ class GuardService : Service(),
             !advertiser.supported || advertiser.startRejected,
         )
 
-        scanner.apply(radioProfile, store.powerProfile, store.boxBleAddress.takeIf { store.boxEnabled })
-        advertiser.start(radioProfile, composeBeacon())
+        val profile = effectiveRadioProfile()
+        scanner.apply(profile, store.powerProfile, store.boxBleAddress.takeIf { store.boxEnabled })
+        advertiser.start(profile, composeBeacon())
     }
+
+    /** The engine's profile, lifted while a group command is going out. */
+    private fun effectiveRadioProfile(): RadioProfile =
+        if (radioProfile == RadioProfile.CALM && composer.controlPending(now())) {
+            RadioProfile.ALERT
+        } else {
+            radioProfile
+        }
 
     // =====================================================================
     // Tick loop
@@ -468,6 +507,14 @@ class GuardService : Service(),
         val now = now()
         readBatteryOccasionally(now)
         ensureRadiosHealthy(now)
+        // Entering or leaving an announcement changes how hard the radios are
+        // driven, and nothing else would notice: the engine's own profile has
+        // not moved.
+        val nowAnnouncing = composer.controlPending(now)
+        if (nowAnnouncing != announcing) {
+            announcing = nowAnnouncing
+            restartRadios()
+        }
         simulator.tick(now)
         engine.tick(now)
         advertiser.updatePayload(composeBeacon())
@@ -480,7 +527,12 @@ class GuardService : Service(),
         // here too and not only in onBroadcastEvent - otherwise a rehearsal
         // would quietly put EVENT_ALARM on the air for a second and set off
         // everyone else's phone.
-        val alarming = engine.state == GuardState.ALARM && !rehearsing
+        //
+        // Only the phone that decided on the incident repeats it. A phone that
+        // is merely joining in stays quiet on the wire, so there is exactly one
+        // thing to silence; see ThreatEngine.alarmOriginatedHere.
+        val alarming = engine.state == GuardState.ALARM &&
+            engine.alarmOriginatedHere && !rehearsing
         val alarmEvent = if (engine.alarmReason == AlarmReason.BOX_TAKEN) {
             Protocol.EVENT_BOX_ALARM
         } else {
@@ -530,6 +582,19 @@ class GuardService : Service(),
         // needs the accelerometer running rather than the slow hardware
         // wake-up trigger. Disarmed goes back to the near-free trigger.
         motion.setGuardActive(current != GuardState.DISARMED)
+
+        // Plenty of things arm and disarm this phone without the UI being
+        // involved at all: "arm all" from somebody else's phone, "disarm all",
+        // the Disarm action on the notification, the lock-screen alarm surface.
+        // The persisted flag has to follow every one of them, or the guard and
+        // the app disagree about whether anything is being watched - and a
+        // restart quietly undoes what the group asked for. Rehearsals are
+        // excluded: they arm the engine on purpose without arming the phone,
+        // and stopSimulation() reads this flag to put things back.
+        if (!rehearsing) {
+            val protecting = current != GuardState.DISARMED
+            if (store.armed != protecting) store.armed = protecting
+        }
 
         when (current) {
             GuardState.PENDING -> {
@@ -715,11 +780,15 @@ class GuardService : Service(),
      * happen or the phone is left armed and holding a simulated speaker.
      */
     private fun stopSimulation() {
-        simulator.stop()
+        // Read first, and put the engine back *before* the rehearsal flag is
+        // cleared: the state changes below would otherwise be mistaken for real
+        // ones and write the rehearsal's armed state to disk.
+        val restoreArmed = store.armed
         if (engine.state == GuardState.ALARM) engine.clearAlarm(now())
-        if (!store.armed && engine.state != GuardState.DISARMED) {
+        if (!restoreArmed && engine.state != GuardState.DISARMED) {
             engine.disarm(now())
         }
+        simulator.stop()
         // Restore the real speaker configuration, which a scenario may have
         // replaced with a virtual one.
         engine.configureBox(

@@ -22,6 +22,7 @@ class BeaconComposer(private val store: GuardStore) {
 
     private var voteCursor = 0
     private var nameCursor = 0
+    private var controlAlternates = false
 
     /**
      * Queues a group command. Repeated for [CONTROL_REPEAT_MS] so that a peer
@@ -31,7 +32,12 @@ class BeaconComposer(private val store: GuardStore) {
         controlEvent = eventType
         controlSubject = subjectId
         controlUntil = now + CONTROL_REPEAT_MS
+        controlAlternates = false
     }
+
+    /** True while a group command is still being repeated. */
+    fun controlPending(now: Long): Boolean =
+        now < controlUntil && controlEvent != Protocol.EVENT_NONE
 
     fun clearControl() {
         controlEvent = Protocol.EVENT_NONE
@@ -64,9 +70,20 @@ class BeaconComposer(private val store: GuardStore) {
             return Triple(input.alarmEvent, input.alarmSubject, null)
         }
 
-        // 2. Group commands, briefly.
-        if (input.now < controlUntil && controlEvent != Protocol.EVENT_NONE) {
-            return Triple(controlEvent, controlSubject, null)
+        // 2. Group commands - "arm everyone", "everybody stop" - repeated for
+        //    long enough that a phone scanning at the calm duty cycle cannot
+        //    miss the whole burst. That is not a comfort margin: LOW_POWER is a
+        //    512 ms window every 5.12 s, so a four second announcement could
+        //    fall entirely between two windows, and "arm all" simply did not
+        //    reach the other phone about half the time.
+        //
+        //    Votes are interleaved rather than starved: a suspicion in flight
+        //    when somebody presses a button still gets aired every other packet.
+        if (controlPending(input.now)) {
+            controlAlternates = !controlAlternates
+            if (controlAlternates || input.votes.isEmpty()) {
+                return Triple(controlEvent, controlSubject, null)
+            }
         }
 
         // 3. Consensus votes, rotating so several suspects all get aired.
@@ -112,7 +129,16 @@ class BeaconComposer(private val store: GuardStore) {
     )
 
     companion object {
-        /** How long a queued group command keeps being repeated. */
-        const val CONTROL_REPEAT_MS = 4_000L
+        /**
+         * How long a queued group command keeps being repeated.
+         *
+         * Sized against the slowest listener rather than against how long the
+         * command "feels" like it should take: two full LOW_POWER scan cycles
+         * plus margin, so every phone in the group gets several chances to hear
+         * it. The sender also lifts its advertising rate for the duration (see
+         * `GuardService.announcing`), which is the other half of making these
+         * commands dependable.
+         */
+        const val CONTROL_REPEAT_MS = 12_000L
     }
 }

@@ -71,6 +71,15 @@ Swiping the app out of Recents stops it.
 (`GuardStore`, `ThreatEngine`). The UI reads them over the channel and writes
 back patches. There is no second copy in Dart that could drift.
 
+That extends to *how* the guard's state changes. Plenty of things arm and
+disarm a phone without the UI being involved at all — "arm all" from somebody
+else's phone, "disarm all", the Disarm action on the notification, the
+lock-screen alarm surface — so the persisted armed flag follows every state
+transition the engine makes, rather than being written by whichever command
+handler happened to run. Setting it only in the handlers meant a phone armed by
+the group came back **disarmed** after a restart, having spent the afternoon
+guarding.
+
 ---
 
 ## 4. The wire protocol
@@ -113,6 +122,16 @@ of what a mesh of connections would.
   rather than on every packet — otherwise it would mean a flash write every
   second for hours. A crash simply burns the remainder of a block; a number is
   never reused.
+- It is **never reset**, not even when the group changes, and each receiver
+  follows it on **every** beacon rather than only on control ones. Both of
+  those are corrections. This device's id is derived from the group secret and
+  the install id, so leaving a group and rejoining it comes back as the *same*
+  device — with a counter that used to restart at zero, which every phone that
+  remembered the old number then read as a replay. And a reference that only
+  moved when a command happened to arrive could sit thousands of packets behind
+  the sender: blocks are burned four thousand at a time, and once the gap
+  passes half the 16-bit range the wraparound comparison reads genuinely newer
+  as older and throws the command away.
 - The group secret is 80 bits, shown as a 16-character Crockford base-32 code
   (`ABCD-EFGH-JKMN-PQRS` — no I, L, O or U, so it cannot be misread aloud) and
   as a QR code. It never leaves the phones and there is no server.
@@ -122,6 +141,22 @@ of what a mesh of connections would.
 `SUSPECT`, `LOST` (observer votes) · `ALARM`, `BOX_ALARM`, `PANIC` ·
 `ALARM_CLEAR`, `DISARM_ALL`, `ARM_ALL` · `NAME`
 
+### Group commands are repeated, not sent
+
+`ARM_ALL`, `DISARM_ALL` and `ALARM_CLEAR` are one-shot decisions travelling
+over a channel with no acknowledgement, to phones that are listening about ten
+percent of the time. `LOW_POWER` scanning is a 512 ms window every 5.12 s, so a
+short announcement can fall **entirely between two windows** — which is exactly
+what happened: "arm all" reached the other phone about half the time, and there
+was no way to tell the difference between "it did not arrive" and "it did not
+work".
+
+So a queued command is repeated for **12 s** — two full scan cycles plus margin
+— and the sender lifts its own advertising out of the calm profile for the
+duration, because the listener's duty cycle is the one thing the sender cannot
+change. Votes are interleaved rather than starved, so a suspicion in flight when
+somebody presses a button still gets aired every other packet.
+
 ### Names for free
 
 There is no room for a display name in 20 bytes, so names are dripped out two
@@ -129,9 +164,26 @@ characters at a time in the event slot that would otherwise be idle — six
 packets for a 12-character name, at zero extra radio cost.
 
 For `NAME` packets only, bytes 13–15 carry `chunkIndex, char0, char1` instead
-of telemetry. That is safe because a phone only sends name chunks while it is
-**stationary and calm**, and because `FLAG_STATIONARY` — which is what the
-occlusion gate actually keys on — still travels in the untouched flags byte.
+of telemetry. That is safe because `FLAG_STATIONARY` — which is what the
+occlusion gate actually keys on — still travels in the untouched flags byte,
+and because an **armed** phone only spends the slot while it is lying still.
+
+Two rules make that actually deliver a name, rather than merely make one
+possible:
+
+- **A disarmed phone introduces itself whatever it is doing.** Nobody is
+  guarding it, so nothing is reading its motion score and the slot is free.
+  This matters more than it sounds: people are *holding* their phones while
+  they set a group up, and requiring stillness meant neither phone said a word
+  about who it was during the one minute both of them were listening hardest.
+  Everybody put their phone down on the towel already anonymous.
+- **Meeting somebody new is worth 25 s of fast radio.** Six different packets
+  have to be caught before a name can be read; at the calm duty cycle that is
+  one packet every five seconds out of a rotation of six, so a full name takes
+  well over a minute of both phones lying perfectly still. Both ends escalate
+  simultaneously — each is new to the other — and the name arrives in a couple
+  of seconds. The window is anchored to when the peer was **first heard**, so a
+  phone whose owner never set a name costs this once rather than repeatedly.
 
 ---
 
@@ -330,6 +382,8 @@ result arrives about every five seconds.
 | Observer is walking around | Abstains from voting |
 | Peer is disarmed | Not guarded |
 | Bluetooth switched off mid-session | Warning surfaced; radios restart automatically when it returns |
+| A phone misses a group command | It is repeated for 12 s at a lifted advertising rate; the group list says who is actually guarding, so the command is never *assumed* to have landed |
+| A phone misses the "everybody stop" | The others stay quiet regardless — only the deciding phone keeps the alarm on the air, so nothing can restart them. That one phone is disarmed on its own |
 
 ---
 
@@ -377,7 +431,11 @@ even while disarmed. The home screen shows a warning chip when this happens.
    Android 8.1 and up simply ignores an unfiltered scan while the screen is off.
 2. **At the lowest duty cycle that works.** `SCAN_MODE_LOW_POWER` is roughly a
    512 ms window every 5.12 s. It escalates to `SCAN_MODE_LOW_LATENCY` only
-   when the engine has real evidence to chase, and drops straight back.
+   when the engine has real evidence to chase, and drops straight back. Two
+   other things buy a bounded escalation, both because the calm duty cycle is
+   too sparse for a short-lived message to survive: **meeting a phone whose
+   name we do not know yet** (25 s, §4) and **announcing a group command**
+   (12 s, §4).
 3. **Restart-throttled.** Android silently blocks an app that starts/stops
    scans more than five times in thirty seconds, and a blocked scanner is a
    guard that does not work. Restarts are coalesced to one per 6 s.
@@ -572,6 +630,45 @@ straight away that the phone is protected — which is most of the deterrent, an
 costs nothing when it turns out to be the owner. The group siren is still a
 grace period away.
 
+### One incident has exactly one source
+
+Every phone in the group makes noise, but only the phone that **decided** on the
+incident keeps `EVENT_ALARM` on the air. A phone joining in stays silent on the
+wire.
+
+That is not a bandwidth optimisation. While every alarming phone repeated the
+event, two phones sustained each other indefinitely: silencing one made it fall
+quiet for a fraction of a second, hear the other still repeating, and start
+again — which the other then heard, and so on. Neither phone could be stood down
+at all. Closing the app did not help, because an alarm in progress deliberately
+defers the shutdown (§6b), so both services kept broadcasting with no window
+anywhere. The only way out was for **everybody to leave the group**, which
+changes the group id so the packets stop authenticating. With one source per
+incident, silencing that source ends it.
+
+The second half of the same problem is timing: a group-wide "stop" cannot land
+on every phone in the same millisecond, so for a few seconds afterwards the air
+still carries packets from the incident that was just called off. Every phone
+therefore ignores **relayed** alarms for 15 s after a group stop.
+
+Three things keep that from becoming a hole:
+
+- **Local detection is untouched.** A phone picked up during the window still
+  alarms, and observers still reach consensus about a peer that is receding.
+  Only the relay shortcut is muted, and the relay is the fast path, not the
+  only one.
+- **A panic is exempt.** Somebody's thumb on a button is news by definition, and
+  since relays no longer repeat alarms, nothing but the phone whose button was
+  pressed can put that event on the air.
+- **It is bounded, and arming clears it.** Fifteen seconds, against a command
+  that is repeated for twelve — long enough that the last phone to obey cannot
+  re-trigger the first, short enough that a real theft moments after a false
+  alarm is still heard.
+
+A plain local disarm — switching your own phone off guard — deliberately does
+**not** start that window. It is not about an incident, and it must not stop
+your phone hearing that somebody else's is being taken.
+
 ### Disarming
 
 `ui/AlarmActivity.kt` is a plain Android activity, not a Flutter route: it has
@@ -612,25 +709,47 @@ heads-up notification and the siren still plays.
 
 ---
 
-## 8b. First run and permissions
+## 8b. First run, groups and permissions
 
-`lib/screens/onboarding_screen.dart` · `lib/screens/permissions_screen.dart` ·
-`lib/core/permissions.dart`
+`lib/screens/onboarding_screen.dart` · `lib/screens/group_gate_screen.dart` ·
+`lib/screens/permissions_screen.dart` · `lib/core/permissions.dart`
 
-### The walkthrough
+### Three surfaces, and why the split matters
 
-Four steps, in the order that lets someone actually get protected: **who you
-are → which group → how you prove it is you → what Android needs**.
+The root widget picks one of three, in this order:
+
+| Condition | Screen |
+| --- | --- |
+| First run not finished | **Onboarding** — your name, then permissions |
+| No group | **Group** — create or join |
+| Otherwise | **Home** |
+
+Setting this phone up and belonging to a group are **not the same event**.
+Setting up happens once in the life of the install. A group is a state the app
+moves in and out of all afternoon — people leave one and join another, and a
+group ends the moment everybody does.
+
+They used to be one four-step wizard, and conflating them was worse than
+untidy: leaving a group threw the user back to a welcome screen, a name field
+they had already filled in, and a progress bar counting through a PIN and a
+permissions walkthrough that were both long since done. The wizard is now two
+steps, neither of which mentions groups, and the group screen is a first-class
+destination rather than a stage of something else. The PIN moved to
+**Settings ▸ Disarming**, where it can be changed rather than only set.
 
 Completion is **recorded natively**, not inferred. It used to be inferred from
-"does a group exist", which becomes true at step two — so the root widget swapped
-the whole wizard out for the home screen the instant the group was created. The
-user got two steps of a four-step progress bar and never saw the PIN page or the
-permissions walkthrough at all, leaving a guard that could not raise a
-lock-screen prompt and would be suspended by the battery manager within the
-hour. `onboardingComplete` is set at the end of the last step and nowhere else;
-an interrupted first run resumes at the step it stopped on, and installs that
-predate the flag are migrated as already complete.
+"does a group exist", which became true in the middle of the wizard — so the
+root widget swapped the whole thing out for the home screen the instant the
+group was created, and the permissions walkthrough was never seen at all,
+leaving a guard that could not raise a lock-screen prompt and would be suspended
+by the battery manager within the hour. `onboardingComplete` is set at the end
+of the last step and nowhere else; an interrupted first run resumes where it
+stopped, and installs that predate the flag are migrated as already complete.
+
+> **The name is saved when it is typed, not when a group is created.** It used
+> to ride along with `createGroup`, which is no longer part of this flow — and
+> an unsaved name is a phone that introduces itself to the whole group as a
+> hexadecimal id.
 
 ### The permission list
 
@@ -679,7 +798,7 @@ be revoked, and Bluetooth switched off, from outside the app.
 
 ### Automated — `tools\test-all.ps1`
 
-**58 Kotlin/JUnit tests** covering the rules that matter. Every one corresponds
+**69 Kotlin/JUnit tests** covering the rules that matter. Every one corresponds
 to a real situation:
 
 - *Suppression*: person walking between phones; sustained drop from a stationary
@@ -704,8 +823,18 @@ to a real situation:
   leaves calibration promptly, and reports when its pickup detector is ready.
 - *Speaker*: a guarded speaker losing its link alarms; one that was never
   connected does not; pointing at a different speaker clears the latch.
-- *Group control*: relayed alarms; **replayed control packets rejected**;
-  sequence wraparound.
+- *Group control*: relayed alarms; **a cleared alarm is not restarted by the
+  phone that has not caught up yet** (regression test — this is the two-phone
+  deadlock); **joining somebody else's alarm does not put it back on the air**;
+  a phone that decides for itself does broadcast; "disarm all" stays disarmed;
+  a genuinely new alarm is still heard once the echo window passes; a plain
+  local disarm does not deafen the phone to the group; a panic gets through
+  immediately after a group stop; **replayed control packets rejected**; a
+  sender that has run far ahead is still obeyed; sequence wraparound.
+- *Names*: meeting a phone with no name speeds the radio up and drops back the
+  moment the name arrives; a phone that never sends one does not hold the radio
+  up forever; a disarmed phone introduces itself even while it is being
+  handled, and an armed one does not.
 - *Energy*: calm guard stays on the low-power profile; passers-by do not
   escalate the radios; suspicion escalates then relaxes.
 - *Settings*: every tunable round-trips; partial patches leave the rest alone;
@@ -713,10 +842,11 @@ to a real situation:
 - *Protocol*: round-trips, tampering, foreign groups, wrong keys, truncation,
   group-code encoding including O/0 confusion, name reassembly.
 
-Plus **9 Dart tests** on snapshot decoding and the consensus mirror — malformed
+Plus **11 Dart tests** on snapshot decoding and the consensus mirror — malformed
 payloads, NaN values, unknown enum names from a future native build, that the
-UI's copy of the consensus rule agrees with Kotlin's, and that an unfinished
-first run is never mistaken for a finished one.
+UI's copy of the consensus rule agrees with Kotlin's, that an unfinished first
+run is never mistaken for a finished one, and that **leaving a group does not
+undo the first run**.
 
 ### In-app simulator — Settings ▸ Testing
 
@@ -767,7 +897,7 @@ connected are skipped automatically.
 | --- | --- |
 | `lib/core/` | Theme, models, platform-channel client, `GuardController`, the permission list |
 | `lib/widgets/` | Shield button, peer/box cards, shared chrome |
-| `lib/screens/` | Onboarding, permissions, home, group, settings, box setup, simulator, QR scan |
+| `lib/screens/` | Onboarding, group gate, permissions, home, group, settings, box setup, simulator, QR scan |
 | `android/.../ble/` | `Protocol`, `BleAdvertiser`, `BleScanner`, `BeaconComposer`, `BleDiscovery` |
 | `android/.../guard/` | `ThreatEngine`, `Filters`, `Models`, `BoxGuard` |
 | `android/.../sensors/` | `MotionMonitor` |
@@ -809,6 +939,7 @@ connected are skipped automatically.
 
 | Version | Change |
 | --- | --- |
+| 1.5.0 | First test with two phones actually in a group. **(a) The group could not be got out of an alarm.** Every alarming phone repeated `EVENT_ALARM` continuously, so two phones sustained each other: silencing one made it fall quiet for a fraction of a second, hear the other still repeating, and start again. "Disarm all" and "stop and disarm everyone" therefore appeared to do nothing, closing the app did not help — an alarm in progress defers the shutdown on purpose — and the only escape was for everybody to leave the group, which changes the group id so the packets stop authenticating. Now exactly one phone speaks for each incident: a phone joining in makes just as much noise but stays silent on the wire, and every phone ignores *relayed* alarms for 15 s after a group stop so the last phone to obey cannot re-trigger the first. Local detection is untouched throughout, and a panic is exempt. **(b) "Arm all" reached the other phone about half the time.** A group command was repeated for four seconds; a listener on the calm profile samples for 512 ms every 5.12 s, so the whole announcement could fall between two windows. Commands are now repeated for 12 s and the sender lifts its own advertising rate for the duration, since the listener's duty cycle is the one thing it cannot change. **(c) A phone armed by the group came back disarmed after a restart.** The persisted armed flag was written by the command handlers, so nothing that changed the guard's state from outside the UI — "arm all", "disarm all", the notification action, the lock-screen disarm — was recorded. It now follows every state transition the engine makes. **(d) Nobody's name ever appeared.** Names are dripped out six packets at a time and were only sent while the phone was lying still, which is precisely not what a phone is doing while its owner sets a group up — and at the calm duty cycle assembling one takes over a minute anyway. A disarmed phone now introduces itself whatever it is doing, and meeting a new phone buys 25 s of fast radio at both ends, so names arrive in seconds. **(e) Leaving a group stopped the app updating** until it was restarted, because the service cleared the Flutter bridge's snapshot listener on shutdown and nothing put it back — which is why creating the next group reported Bluetooth as off. The listener belongs to the bridge; the UI also no longer claims the radio is off merely because it has not heard yet. **(f) Rejoining a group looked like a replay attack**: the sequence counter was reset when the group changed, but the device id is derived from the secret and the install id, so the same device came back with a lower number and had its commands discarded. The counter is never reset now, and receivers follow it on every beacon rather than only on commands. **(g) First run and groups are separate screens.** Leaving a group used to reopen the four-step wizard — welcome, a name already set, a PIN and a permissions walkthrough long since done. The wizard is two steps and runs once; creating or joining a group is its own screen, shown whenever there is no group. The PIN moved to Settings ▸ Disarming. |
 | 1.4.0 | Two-phone field test. **(a) No phone had ever seen another phone.** The scanner filtered on a *service UUID*, while the beacon carries its payload as *service data* and nothing else. `ScanRecord.getServiceUuids()` is populated only from the service-UUID list AD types, never from service data, and the framework applies that filter in software regardless of what the controller offloads — so the filter matched no packet at all, on every device, since the first commit. Both radios worked perfectly and the mesh simply never formed; with one phone there is nothing to notice. The filter now matches service data, keyed on the version byte so foreign traffic is still rejected in hardware. Two counters — packets heard, and how many of those authenticated as this group — are now on the home screen, because "nothing is arriving" and "things arrive and are discarded" are different faults that look identical from an empty group list. The capability check for advertising was also over-strict: it used `isMultipleAdvertisementSupported`, which answers whether *several* sets can run at once, so phones that can advertise perfectly well were refusing to. **(b) The guard now stops when the app is closed.** It used to outlive the app deliberately; an ongoing notification for an app with no window is indistinguishable from one that will not go away. Swiping BeachProtect out of Recents shuts the radios, the wake lock, the heartbeat and both notifications down in order, a sticky restart with no task in Recents stands down rather than reposting the notification, and the boot receiver is gone. An alarm already sounding is the one exception: it finishes first, so a siren cannot be silenced by flicking a card off the Recents screen. |
 | 1.3.0 | Third field-test round. **(a) A lift that started gently switched the pickup detector off** instead of triggering it: readiness is derived from "how long has this phone been lying still", and the first sample reporting movement clears that marker — so any lift whose opening sample fell below `motionScoreThreshold` left every later, stronger sample looking at a phone that had not been lying still. The phone could be carried off in silence, and all the owner saw was the app asking them to put it down again. Readiness is now decided once, when movement begins, and latched until the phone comes to rest; sustained movement counts even with no decisive sample; and the home screen no longer shows the "put the phone down" chip during the grace period, where it read as the opposite of what the countdown meant. **(b) The peer path was two to three times slower than it needed to be.** The RSSI filter added a fixed amount of process noise per sample, which assumed a constant sample rate and lagged by three to four seconds at the calm scan duty cycle, and the confirmation window only started once the drop was already complete. Process noise now scales with the time since the last sample, the slope window is bounded in time rather than in samples, and an episode starts at 6 dB so confirmation runs alongside the fade — voting still requires the full 11 dB, and a step change behaves exactly as before. A phone carried away at walking pace: 8.8 s → ~4 s. **(c) The first-run walkthrough ended after two of its four steps**, because completion was inferred from "a group exists" — which becomes true at step two — so the PIN page and the entire permissions walkthrough were never shown. Completion is now recorded natively at the end of the last step, an interrupted first run resumes where it stopped, and the home screen carries a standing reminder of anything Android has not allowed yet, since every one of those failures is silent. |
 | 1.2.0 | Second field-test round. **(a) Silent siren**: the alarm used a 176 kB `MODE_STATIC` buffer with `setLoopPoints`, which some devices reject — and `setLoopPoints` signals failure by return code, not exception, so a rejected loop looked like success and played nothing. Rebuilt around `MODE_STREAM` with a writer thread; `sirenAudible` now reports whether audio actually opened, and the UI says so during an alarm. This is why a lone phone detected the lift but never made a sound: rehearsals only play the chirp, so no test ever exercised the siren. **(b) Pickup readiness is now visible** — the detector only arms after the phone has lain still for `settleMs`, and the home screen now shows "Pickup protection active" or a countdown, rather than leaving the user guessing. **(c) Permissions**: a proper explain-then-grant walkthrough replaces the old terse checklist, listing what each permission is for and what breaks without it, re-runnable from Settings. **(d) `BOX_TAKEN` scenario** could never pass without a real paired speaker, and sent a disconnect without a preceding connect; it now borrows a virtual speaker and the engine resets its box-alarm latch when the device changes. Also: the tick loop can no longer be killed by a stray exception, and simulation tidy-up runs even when a scenario ends by itself. |
