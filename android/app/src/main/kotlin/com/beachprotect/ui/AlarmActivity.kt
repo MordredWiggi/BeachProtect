@@ -151,7 +151,7 @@ class AlarmActivity : AppCompatActivity() {
         if (nextMode == GuardState.DISARMED || nextMode == GuardState.ARMED ||
             nextMode == GuardState.CALIBRATING
         ) {
-            finishAndRemoveTask()
+            finish()
             return
         }
 
@@ -385,7 +385,16 @@ class AlarmActivity : AppCompatActivity() {
             putExtra(GuardIntents.EXTRA_SOURCE, "alarm_screen")
         }
         ContextCompat.startForegroundService(this, intent)
-        finishAndRemoveTask()
+        // finish(), never finishAndRemoveTask(). This activity lives in its own
+        // task (see the manifest), but removing *any* of an app's tasks delivers
+        // Service.onTaskRemoved to that app's running services - and GuardService
+        // reads that as "the user closed the app" and shuts the guard down. So
+        // dealing with an alarm from the lock screen killed the guard on that
+        // phone: the group command it had just queued never made it onto the air,
+        // the radios stopped, and everybody else watched it vanish from the mesh.
+        // It came back only when somebody opened the app, which is exactly why
+        // the decision "only worked from inside the app".
+        finish()
     }
 
     companion object {

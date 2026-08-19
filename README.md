@@ -45,8 +45,9 @@ single cross-check removes the entire class of false alarms.
   group, the phone screaming in the thief's hand makes them drop it.
 - **Disarms with a fingerprint or a shared group PIN**, on a full-screen prompt
   that works over the lock screen.
-- **Runs all afternoon.** No continuous sensors while calm, hardware-filtered
-  low-duty scanning, no permanent wake lock.
+- **Runs all afternoon** for roughly **2–4 % of the battery over six hours** on
+  the default setting — hardware-filtered low-duty scanning, no permanent wake
+  lock. See [What it costs the battery](#what-it-costs-the-battery).
 - **Stops when you close it.** The guard runs while the app does — backgrounded,
   screen off, in a pocket — and shuts down completely, notification and all,
   when you swipe the app away.
@@ -93,6 +94,102 @@ Quick version, from the repository root in PowerShell:
    including one that has already gone quiet.
 7. **Packing up?** **Disarm all.**
 
+## What it costs the battery
+
+Short version: **on the default Balanced setting, guarding an afternoon costs
+about as much battery as two minutes of looking at the screen.** The radio is
+cheap; the display is not.
+
+### The three settings
+
+Settings ▸ Power. The only thing that really changes is how much of the time the
+Bluetooth receiver is listening — which is also what decides how quickly the
+group notices anything, so this is a genuine trade rather than a free lunch.
+
+| Setting | Listening | Modelled extra draw | Realistic drain | Over a 6-hour afternoon |
+| --- | ---: | ---: | ---: | ---: |
+| Maximum | 100 % | ~27 mA | **1–2 %/h** | 6–11 % |
+| **Balanced** (default) | 25 % | ~9 mA | **0.3–0.7 %/h** | 2–4 % |
+| Saver | 10 % | ~5 mA | **0.15–0.4 %/h** | 1–2.5 % |
+
+For scale, on the same phone doing nothing else:
+
+| For comparison | Drain |
+| --- | ---: |
+| Screen on, app open | 10–20 %/h |
+| Phone idle in a pocket, screen off, nothing running | 0.5–1.5 %/h |
+| A siren actually going off | ~0.15 %/minute |
+
+So a five-minute alarm costs less than 1 %, and **leaving the screen on for
+three minutes costs more than an hour of guarding**. Lock the phone and put it
+down; that is the setup the whole design assumes.
+
+### Where those numbers come from
+
+Nothing here is a guess dressed up as a measurement. The modelled column is
+arithmetic on two published sets of figures, and you can redo it for your own
+phone.
+
+**What the radio does.** Android's scan modes are fixed duty cycles (AOSP
+`ScanManager`):
+
+| Scan mode | Window | Interval | Duty |
+| --- | ---: | ---: | ---: |
+| `SCAN_MODE_LOW_POWER` (Saver) | 512 ms | 5120 ms | 10 % |
+| `SCAN_MODE_BALANCED` (Balanced) | 1024 ms | 4096 ms | 25 % |
+| `SCAN_MODE_LOW_LATENCY` (Maximum) | 4096 ms | 4096 ms | 100 % |
+
+**What that costs.** From a typical Android `power_profile.xml`: Bluetooth
+controller receiving ≈ 25 mA, idle ≈ 2 mA, transmitting ≈ 30 mA. Balanced is
+therefore `0.25 × 25 + 0.75 × 2 ≈ 7.8 mA` of receiver.
+
+Everything else BeachProtect does is small enough to be a rounding error next to
+that:
+
+| Part | Draw | Why so little |
+| --- | ---: | --- |
+| Scanning (Balanced) | ~7.8 mA | The whole cost, essentially |
+| Advertising | ~0.04 mA | 3 channels × ~0.4 ms once a second is a 0.1 % transmit duty cycle |
+| Accelerometer | ~0.15 mA | 25 Hz, but batched in the sensor hub, so the processor wakes 4 times a second rather than 25 |
+| App CPU and wake-ups | ~1.5 mA | One tick a second, and no wake lock at all while calm |
+
+That totals ~9.4 mA, or 0.21 %/h of a 4500 mAh battery — 1.3 % over six hours.
+
+**Why the "realistic" column is higher.** Measured drain generally lands at
+1.5–3× the modelled figure, for reasons the power model does not capture: the
+application processor cannot reach its deepest sleep states while a scan is
+running, OEM Bluetooth stacks differ considerably, and a busy beach means more
+advertisements getting past the hardware filter and waking the CPU. The range
+given above is the model multiplied out to that band, which is the honest way to
+state it.
+
+**Measuring it yourself**, which is the only number that really counts:
+
+```powershell
+adb shell dumpsys batterystats --reset
+# ...guard for an hour with the screen off...
+adb shell dumpsys batterystats | Select-String "com.beachprotect" -Context 0,12
+```
+
+Android's own **Settings ▸ Battery ▸ Battery usage** works too, and needs no
+cable.
+
+### What the settings actually change
+
+Battery is only half of what you are choosing. The listening duty cycle also
+sets how long a gap between two beacons is normal, and therefore how fast the
+group reacts:
+
+| | Maximum | Balanced | Saver |
+| --- | --- | --- | --- |
+| Group list updates | continuously | ~1 s | every few seconds |
+| "Arm all" reaches everyone in | ~1 s | 1–3 s | 3–10 s |
+| A phone switched off is noticed after | ~13 s | ~13 s | ~15–25 s |
+
+A phone being *carried away* is caught in a few seconds on all three, because
+the first hint of trouble puts every radio on maximum regardless of the setting.
+The saver profile costs you the calm-state responsiveness, not the detector.
+
 ## Testing it
 
 With one phone: turn on **Settings ▸ Testing ▸ Test scenarios** and run the
@@ -110,8 +207,8 @@ With more phones:
 A guided eight-step field protocol with synchronised log capture from every
 device.
 
-Automated suites — 82 Kotlin tests on the detection engine, 14 Dart tests on
-snapshot decoding:
+Automated suites — 94 Kotlin tests on the detection engine, the wire protocol
+and the beacon composer, plus 14 Dart tests on snapshot decoding:
 
 ```powershell
 .\tools\test-all.ps1

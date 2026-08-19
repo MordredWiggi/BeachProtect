@@ -121,6 +121,41 @@ class RollingMedian(private val capacity: Int) {
 }
 
 /**
+ * Maximum over a fixed window of recent samples.
+ *
+ * Used for "how long a gap between two beacons is normal for this peer", which
+ * is what separates a slow scan duty cycle from a phone that has actually gone.
+ * A maximum rather than an average, and a window rather than a decay, because
+ * the answer has to stay put: a threshold that drifts back down between two long
+ * gaps turns every ordinary long gap into a one-tick "no signal", which reads to
+ * the user as a group list flickering at random.
+ */
+class RollingMax(private val capacity: Int) {
+    private val samples = DoubleArray(capacity)
+    private var count = 0
+    private var writeIndex = 0
+
+    val size: Int get() = count
+
+    fun add(sample: Double) {
+        samples[writeIndex] = sample
+        writeIndex = (writeIndex + 1) % capacity
+        if (count < capacity) count++
+    }
+
+    fun max(): Double {
+        var best = 0.0
+        for (i in 0 until count) if (samples[i] > best) best = samples[i]
+        return best
+    }
+
+    fun clear() {
+        count = 0
+        writeIndex = 0
+    }
+}
+
+/**
  * Least-squares slope of the recent RSSI history, in dB per second.
  *
  * Direction matters as much as magnitude. Someone walking between two phones

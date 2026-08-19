@@ -68,13 +68,19 @@ object Protocol {
     /** Decision: "[Beacon.subjectId] is being stolen - everybody sound off." */
     const val EVENT_ALARM = 3
 
-    /** Stop all sirens but stay armed (recalibrates baselines). */
+    /**
+     * Stop all sirens but stay armed (recalibrates baselines).
+     *
+     * One of the three **group commands**. For these, bytes 13..15 read
+     * `originId` (the device that decided it, unchanged through every relay) and
+     * a [Beacon.commandCounter] in place of the motion score.
+     */
     const val EVENT_ALARM_CLEAR = 4
 
-    /** Disarm the whole group ("we are packing up"). */
+    /** Disarm the whole group ("we are packing up"). A group command. */
     const val EVENT_DISARM_ALL = 5
 
-    /** Arm the whole group. */
+    /** Arm the whole group. A group command. */
     const val EVENT_ARM_ALL = 6
 
     /** The guarded speaker box is being taken. */
@@ -104,6 +110,34 @@ object Protocol {
 
     const val NAME_CHUNKS = 6
     const val NAME_MAX_LENGTH = NAME_CHUNKS * 2
+
+    /** The three events that carry a group decision rather than telemetry. */
+    fun isGroupCommand(eventType: Int): Boolean = when (eventType) {
+        EVENT_ALARM_CLEAR, EVENT_DISARM_ALL, EVENT_ARM_ALL -> true
+        else -> false
+    }
+
+    /**
+     * Is [candidate] a later command from the same device than [last]?
+     *
+     * Eight bit comparison with wraparound, exactly as [Beacon.seq] does with
+     * sixteen. Half the range counts as newer, which is far more than the two or
+     * three commands that can ever be in the air at once.
+     *
+     * This is what gives a group command an *identity* rather than only a type,
+     * and identity is what the mesh actually needs. Without it, "arm all, then
+     * disarm all, then arm all again" is three copies of two indistinguishable
+     * messages: a receiver either re-applies every copy — so a relay still
+     * circulating half a minute later quietly undoes a phone somebody has just
+     * armed — or it remembers the type and ignores the second press entirely.
+     * There is no way to be right about both, and the field test hit each of
+     * them in turn. With a counter, a stale copy is simply older and is dropped,
+     * and every genuine press is newer and is obeyed.
+     */
+    fun isNewerCommand(candidate: Int, last: Int): Boolean {
+        val delta = (candidate - last) and 0xFF
+        return delta in 1..0x7F
+    }
 
     /** Device ids reserved as "none" / "broadcast". */
     const val DEVICE_ID_NONE = 0
@@ -348,4 +382,22 @@ data class Beacon(
 
     /** True when this packet's bytes 13..15 are name characters, not telemetry. */
     val carriesName: Boolean get() = eventType == Protocol.EVENT_NAME
+
+    /** True when [motionScore] holds a command counter rather than telemetry. */
+    val carriesCommand: Boolean get() = Protocol.isGroupCommand(eventType)
+
+    /** True when [motionScore] means what it says. */
+    val carriesTelemetry: Boolean get() = !carriesName && !carriesCommand
+
+    /**
+     * Which press of its owner's button this is. Only meaningful when
+     * [carriesCommand].
+     *
+     * There is no room for a field of its own in twenty bytes, so the motion
+     * score is borrowed for the three group-command events — exactly as it is
+     * for name chunks, and safe for the same reason: `FLAG_STATIONARY`, which is
+     * what the occlusion gate actually keys on, still travels untouched in the
+     * flags byte, and the receiver keeps the motion score it already had.
+     */
+    val commandCounter: Int get() = motionScore
 }

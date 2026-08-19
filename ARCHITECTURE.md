@@ -110,6 +110,19 @@ of what a mesh of connections would.
 | 15 | 1 | `motionScore` | 0–255 recent motion energy |
 | 16 | 4 | `mac` | `HMAC-SHA256(groupKey, bytes[0..15])[0..3]` |
 
+Bytes 13–15 are **reinterpreted for two event types**, because twenty bytes is
+what a legacy advertisement can carry and there is nothing else to give:
+
+| Event | 13–14 | 15 |
+| --- | --- | --- |
+| `NAME` | `chunkIndex`, `char0` | `char1` |
+| `ARM_ALL` · `DISARM_ALL` · `ALARM_CLEAR` | issuing device | `commandCounter` |
+
+Both are safe for the same reason: `FLAG_STATIONARY`, which is what the
+occlusion gate actually keys on, still travels untouched in the flags byte, and
+a receiver keeps the motion score it already had rather than reading one from a
+packet that is not carrying one.
+
 ### Security
 
 - The **HMAC** means an outsider cannot inject a fake alarm or a fake
@@ -150,7 +163,21 @@ windows** — which is exactly what happened: "arm all" reached the other phone
 about half the time, and there was no way to tell the difference between "it did
 not arrive" and "it did not work".
 
-Four things carry that load together, because no one of them is sufficient:
+Five things carry that load together, because no one of them is sufficient:
+
+- **A command is identified, not merely typed.** Every press carries a
+  `commandCounter` from the phone that issued it, and origin and counter travel
+  unchanged through every relay. Without that, "arm all, disarm all, arm all"
+  is three copies of two indistinguishable messages, and there is no way to be
+  right about both halves of the problem — the field test walked into each of
+  them in turn. Obey every copy, and a relay still circulating half a minute
+  later quietly stands down a phone somebody has just armed. Remember the
+  *type* for a while instead, and the third press is ignored by every phone that
+  heard the first — which is exactly the sequence anybody testing the app
+  performs in its first minute. With a counter, a stale copy is simply older and
+  is dropped, and every genuine press is newer and is obeyed. The counter is
+  persisted, because a phone that came back from a restart at zero would have its
+  next hundred commands read as stale.
 
 - **The issuer repeats itself for 30 s.** Twelve seconds was the previous answer
   and it was still one or two chances on the saver profile.
@@ -166,15 +193,23 @@ Four things carry that load together, because no one of them is sufficient:
   is what makes a three-phone group work when the far phone is in range of
   nobody but the middle one: one burst becomes an epidemic that reaches everyone
   in range of *anyone*.
-- **Every phone remembers what it has already seen**, keyed by *(command,
-  issuing device)* — an id that travels unchanged through every relay. This is
-  what makes the flood terminate, and it is not optional in a second way: with
-  several phones repeating it, a command stays in the air for the best part of a
-  minute, and re-applying every copy would quietly stand down a phone the user
-  had just armed again.
+- **A copy that is not newer is neither obeyed nor passed on.** That one rule is
+  what makes the flood terminate: each phone repeats each press at most once.
 
 Votes are interleaved rather than starved, so a suspicion in flight when
 somebody presses a button still gets aired every other packet.
+
+**An alarm is not a group command, and must not be sent like one.** It rides on
+the guard's live state in every beacon (`BeaconComposer.chooseEvent`) and leaves
+the air the instant the alarm does. Queuing it as a repeating message *as well* —
+which is what happened, through the same path a group command takes, with
+nothing ever cancelling the queue — meant a phone went on broadcasting "theft!"
+for the whole repeat window after its siren had been silenced. Every other phone
+heard an incident that no longer existed: the group-alarm banner came back by
+itself long after everybody had stood down, and once the echo window lapsed a
+phone could be pulled into a fresh, real siren by a packet describing something
+that had ended half a minute earlier. Lengthening the repeat window for the
+commands' sake made it worse in exact proportion.
 
 A command is never *assumed* to have landed. The count under **Group** is the
 only honest answer, and pressing the button again is safe: a phone that already
@@ -458,7 +493,7 @@ mid-rearm, "moving away" from a two-hundred-millisecond dip. Watching that
 flicker between four states while nothing at all was happening is what "the
 state handling is completely broken" looked like from the outside.
 
-Three rules now:
+Four rules now:
 
 - **Silence is its own state and it outranks memories.** `linkStale` is decided
   natively, against the same adaptive threshold the `LOST` vote uses, and the
@@ -466,6 +501,12 @@ Three rules now:
   and its telemetry chips are hidden rather than shown as though current. The
   UI had its own flat eight second rule, which at the old default duty cycle was
   shorter than an ordinary gap between two scan results.
+- **The threshold does not wander.** "How long a gap is normal here" is the
+  maximum over a window of recent arrivals, not a decaying average. A decay is
+  the wrong shape: a few quiet seconds after one unusually long gap would return
+  the threshold to its floor, and the next perfectly ordinary long gap would flip
+  the peer to "no signal" for a tick. A number that answers "is this unusual?"
+  must not itself be unstable.
 - **"N of M guarding" counts phones we can currently hear.** A peer whose last
   beacon said "armed" half a minute ago is not evidence of anything.
 - **A suspicion has to last a second before it is drawn.** Brief episodes are
@@ -475,6 +516,12 @@ Three rules now:
 Disarming also clears every in-flight episode. Leaving them set is what left the
 group list reading "moving away" about phones nobody was watching any more, for
 as long as the app stayed open.
+
+**And an accusation is withdrawn the moment it is disproved.** A `LOST` vote
+used to survive the peer's return for the whole eight second vote lifetime,
+because the branch that noticed the peer was back skipped past the retraction
+whenever that peer had no learned baseline. A second observer agreeing with a
+withdrawn accusation is a siren about a phone lying on the towel.
 
 ---
 
@@ -618,6 +665,11 @@ the air completely silent. Inexact on purpose — an exact alarm would require
 | **Balanced** (default) | `BALANCED` (~25 % duty) | Escalates on evidence. Peers update roughly once a second |
 | Saver | `LOW_POWER` (~10 % duty) + hardware batching | Cheapest by a good margin; peers update every few seconds and group commands take longer to reach everybody |
 
+What each of them costs, with the arithmetic shown, is in
+**[README ▸ What it costs the battery](README.md#what-it-costs-the-battery)**.
+The short version is that Balanced adds under half a percent an hour, and the
+screen costs thirty times that.
+
 **Every one of these moved up a notch in 1.6.0**, which is a deliberate reversal
 of what the table used to say. The old default listened about a tenth of the
 time, and the rest of the system had been tuned as though it listened
@@ -670,6 +722,22 @@ Three details make that hold in practice:
   restart with a null intent the service checks whether the app still has a task
   in Recents, and stops if it does not. It still recovers normally from a
   genuine memory-pressure kill, which is what stickiness is for.
+- **Only the app's *own* task counts.** `onTaskRemoved` is delivered for **any**
+  task belonging to the app, not only the one the user swiped — and the
+  lock-screen alarm surface deliberately runs in a task of its own. So dealing
+  with an alarm from the lock screen tidied that task away, the service read it
+  as "the app was closed", and the guard shut down mid-incident: radios off, the
+  group command it had just queued never transmitted, and the phone gone from
+  everybody else's mesh until somebody opened the app again. That is why
+  silencing an alarm from the lock screen appeared to work locally and reach
+  nobody, and why the same decision taken from inside the app did work. Two
+  defences now: the alarm surface calls `finish()` rather than
+  `finishAndRemoveTask()`, and the service ignores the removal of any task not
+  rooted at `MainActivity`.
+
+  > This was also a large part of "the peer states flicker". A phone whose guard
+  > had silently stopped is a phone that has vanished from the mesh, and a phone
+  > that has vanished is exactly what the rest of the group is built to react to.
 
 **No boot receiver.** The guard used to restore itself after a reboot if it had
 been armed. It no longer does, for the same reason: nobody opened the app, so
@@ -798,9 +866,17 @@ Three things keep that from becoming a hole:
   alarms, and observers still reach consensus about a peer that is receding.
   Only the relay shortcut is muted, and the relay is the fast path, not the
   only one.
-- **A panic is exempt.** Somebody's thumb on a button is news by definition, and
-  since relays no longer repeat alarms, nothing but the phone whose button was
-  pressed can put that event on the air.
+- **A panic is exempt from the window** — somebody's thumb on a button is news
+  by definition, and since relays no longer repeat alarms, nothing but the phone
+  whose button was pressed can put that event on the air. It is *not* exempt
+  from a decision the user has already made about that same incident, or nobody
+  could ever silence a panicking phone whose owner is still holding the button.
+
+  > A panic used to go out as a plain `EVENT_ALARM`, which quietly made the one
+  > thing this paragraph promises impossible: nothing ever put `EVENT_PANIC` on
+  > the air, so the code exempting it could never run, and the unit test covering
+  > it was feeding the engine a packet the app does not send. A panic pressed
+  > just after somebody called an incident off was swallowed like any other echo.
 - **It is bounded, and arming clears it.** Fifteen seconds, against a command
   that is repeated for twelve — long enough that the last phone to obey cannot
   re-trigger the first, short enough that a real theft moments after a false
@@ -822,7 +898,10 @@ towel might want, and the app used to offer neither of them properly:
 
 Both are on the lock-screen alarm surface, on the alarm notification, and on the
 home screen, and **both reach the whole group from whichever phone is being
-held** — including one that has already gone quiet.
+held** — including one that has already gone quiet. Authenticating on the
+lock-screen surface carries out the choice that was tapped, whichever it was;
+which button was pressed is held until the fingerprint or PIN comes back, and
+the surface no longer takes the guard down with it on the way out (§6b).
 
 That last clause is the fix. Three separate things conspired to make an alarm
 almost impossible to get out of cleanly:
@@ -977,7 +1056,7 @@ be revoked, and Bluetooth switched off, from outside the app.
 
 ### Automated — `tools\test-all.ps1`
 
-**82 Kotlin/JUnit tests** covering the rules that matter. Every one corresponds
+**94 Kotlin/JUnit tests** covering the rules that matter. Every one corresponds
 to a real situation:
 
 - *Suppression*: person walking between phones; sustained drop from a stationary
@@ -1014,13 +1093,21 @@ to a real situation:
   sender that has run far ahead is still obeyed; sequence wraparound.
 - *Commands reaching everybody*: a command is passed on, exactly once, with its
   origin intact; the phone that issued it ignores it coming back; **a relay
-  arriving after the user re-armed does not stand them down again** (regression
-  test).
+  arriving after the user re-armed does not stand them down again** and
+  **pressing the same button again is obeyed** (regression tests — the two
+  halves that cannot both be satisfied without a command counter); a stale copy
+  of an older command is ignored; counter wraparound.
+- *The event slot* (`BeaconComposerTest`): **an alarm is on the air only while
+  it is actually sounding** (regression test); a panic goes out as a panic; a
+  command carries its origin and counter and stops when its window closes; an
+  alarm outranks a queued command and the command survives it; votes are
+  interleaved rather than starved; a name is dripped out and reassembles.
 - *Getting out of an alarm*: **an incident the user silenced cannot restart
   itself a minute later** (regression test — this is the originator that keeps
   shouting); a phone that has stood itself down still knows the group is
   alarming; stopping a false alarm leaves the phone guarding; disarming forgets
-  what it was suspicious about.
+  what it was suspicious about; **a lost vote is withdrawn as soon as the peer is
+  heard again** (regression test).
 - *Names*: meeting a phone with no name speeds the radio up and drops back the
   moment the name arrives; a phone that never sends one does not hold the radio
   up forever; **a phone that stayed anonymous gets another chance later**; a
@@ -1033,6 +1120,10 @@ to a real situation:
   any numeric type is accepted; nonsense values are clamped rather than obeyed.
 - *Protocol*: round-trips, tampering, foreign groups, wrong keys, truncation,
   group-code encoding including O/0 confusion, name reassembly.
+
+The Kotlin suite is split across `ThreatEngineTest` (the rules), `ProtocolTest`
+(the wire format), `BeaconComposerTest` (what goes into the one event slot, and
+what stops going into it) and `EngineConfigCodecTest` (settings round-trips).
 
 Plus **14 Dart tests** on snapshot decoding and the consensus mirror — malformed
 payloads, NaN values, unknown enum names from a future native build, that the
@@ -1133,6 +1224,7 @@ connected are skipped automatically.
 
 | Version | Change |
 | --- | --- |
+| 1.6.1 | Follow-up to 1.6.0, from the same session. The user's own diagnosis was right: **things that were over were still being broadcast.** **(a) A silenced alarm stayed on the air for the whole command repeat window.** Raising an alarm queued `EVENT_ALARM` as a *repeating group command* as well as riding on the guard's live state, and nothing ever cancelled that queue — so a phone went on shouting "theft!" for up to half a minute after its siren had been silenced. Every other phone heard an incident that no longer existed: the group-alarm banner reappeared by itself long after everybody had stood down, peers showed as "Alarming", and once the fifteen second echo window lapsed a phone could be dragged into a fresh, real siren by a packet describing something that had ended. Lengthening the repeat window in 1.6.0 for the commands' sake had made it proportionally worse. The alarm is now derived from live state only and leaves the air on the very next beacon; `BeaconComposerTest` exists to keep it that way. **(b) Dealing with an alarm from the lock screen shut the guard down.** `onTaskRemoved` is delivered for *any* task belonging to the app, and the alarm surface deliberately runs in a task of its own — so tidying it away read as "the user closed the app", and the service stopped mid-incident with the group command it had just queued still unsent. That is exactly why the decision "only worked from inside the app", and a phone whose guard has silently stopped is a phone that has vanished from the mesh, which is most of the remaining state churn. Now `finish()` rather than `finishAndRemoveTask()`, and the service ignores any task not rooted at `MainActivity`. **(c) Group commands now carry a counter**, persisted, identifying one press. 1.6.0 remembered commands by *type* for ninety seconds to stop a circulating relay re-applying itself, which broke the first sequence anybody performs: arm all, disarm all, arm all — the third press was ignored by every phone that had heard the first. Obeying every copy instead reintroduces the original problem. Neither is fixable without an identity, so one press is now one number, riding in the motion-score byte exactly as name chunks ride in the subject field. **(d) A `LOST` vote was never withdrawn** when the peer came back, if that peer had no learned baseline — the branch that noticed the return skipped straight past the retraction. **(e) The staleness threshold wandered**: it was a decaying average, so a few quiet seconds after one long gap returned it to its floor and the next ordinary long gap flipped the peer to "no signal" for a tick. It is now a maximum over a window of arrivals. **(f) A panic went out as a plain alarm**, so the exemption that is the entire point of the panic button could never run — and the test covering it was feeding the engine a packet the app never sent. **(g)** The group-alarm belief is reset by any group stop, so the banner goes when the group does and comes back within a second if somebody genuinely has not stopped. Also: a section on what each power setting actually costs the battery, with the arithmetic shown, in the README. |
 | 1.6.0 | Second two-phone test. Four reports, one root cause behind most of them: **the rest of the system was tuned as though the radio listened continuously, and by default it listened about a tenth of the time.** **(a) Group commands were unreliable, and visibly better at the Maximum battery setting.** A command was announced in a single twelve second burst, and a phone whose advertising re-tune was requested while the Bluetooth stack was still bringing a set up had that request *dropped silently* — so the announcement went out at the calm one-per-second rate, to a listener sampling 10 % of the time, with nothing to retry it because the health check only asked whether advertising was running at all. Commands are now repeated for 30 s, queued re-tunes are applied when the stack returns, the health check compares the rate on the air against the rate asked for, and **every phone passes a command on the first time it sees it** — so one burst becomes an epidemic that reaches everyone in range of anyone. Commands are remembered by *(command, issuing device)*, which terminates the flood and stops a relay still circulating a minute later from standing down a phone the user has just armed again. The scanner also stopped rationing its restarts evenly and now spends four of Android's five allowed starts per thirty seconds where they matter, so an escalation is immediate rather than up to six seconds late. **(b) Peer state churned between arbitrary values, and names never arrived.** The peer-loss test was a flat ten seconds against a duty cycle whose ordinary gap between two beacons was routinely longer than that, so observers voted `LOST` about phones lying on the same towel — and in a two-phone group one vote is the whole consensus, evaluated in the same tick, so it alarmed on the spot. That threshold now scales with the gaps actually observed from each peer and needs the silence to survive three further seconds of escalated radio; the UI's separate eight second staleness rule is gone, replaced by the engine's own answer; silence outranks stale telemetry on the card; and a suspicion has to last a second before it is drawn. Names get repeated attempts rather than one 25 s window, are sent during calibration too, and are **persisted once learned**. **(c) Disarming one phone left the others screaming with no way back to them.** The alarm controls were gated on the local state, so silencing your own handset replaced them with "Arm all"; they now follow *the group*. The lock-screen prompt disarmed the phone it was pressed on while telling everybody else to keep guarding, which is why the group came out of every incident in a mixed state — it now offers **"Stop the alarm"** (silences everyone, everyone keeps guarding) and **"Stop and disarm everyone"**, and both work from a phone that has already gone quiet. **(d) A silenced phone re-joined the alarm fifteen seconds later.** The originator keeps `EVENT_ALARM` in every beacon for as long as it is alarming, so a fixed echo window only postponed the problem. Silencing an alarm now declines that *incident* — identified by source and subject — for as long as it is still audible. Disarming also clears every in-flight episode. **(e) The power profiles moved up a notch**: Balanced is now `SCAN_MODE_BALANCED`, Saver keeps the old `LOW_POWER`, Maximum is continuous, and the settings screen says plainly what the sparse setting costs. **(f)** The alarm notification and the full-screen prompt used to hang around for the whole eight second calibration window after "stop, keep guarding", because the state they were waiting for was `CALIBRATING` and only `ARMED`/`DISARMED` cleared them. A phone switched off is now detected in ~13.5 s rather than ~10.5 s, which is the deliberate price of (b). |
 | 1.5.0 | First test with two phones actually in a group. **(a) The group could not be got out of an alarm.** Every alarming phone repeated `EVENT_ALARM` continuously, so two phones sustained each other: silencing one made it fall quiet for a fraction of a second, hear the other still repeating, and start again. "Disarm all" and "stop and disarm everyone" therefore appeared to do nothing, closing the app did not help — an alarm in progress defers the shutdown on purpose — and the only escape was for everybody to leave the group, which changes the group id so the packets stop authenticating. Now exactly one phone speaks for each incident: a phone joining in makes just as much noise but stays silent on the wire, and every phone ignores *relayed* alarms for 15 s after a group stop so the last phone to obey cannot re-trigger the first. Local detection is untouched throughout, and a panic is exempt. **(b) "Arm all" reached the other phone about half the time.** A group command was repeated for four seconds; a listener on the calm profile samples for 512 ms every 5.12 s, so the whole announcement could fall between two windows. Commands are now repeated for 12 s and the sender lifts its own advertising rate for the duration, since the listener's duty cycle is the one thing it cannot change. **(c) A phone armed by the group came back disarmed after a restart.** The persisted armed flag was written by the command handlers, so nothing that changed the guard's state from outside the UI — "arm all", "disarm all", the notification action, the lock-screen disarm — was recorded. It now follows every state transition the engine makes. **(d) Nobody's name ever appeared.** Names are dripped out six packets at a time and were only sent while the phone was lying still, which is precisely not what a phone is doing while its owner sets a group up — and at the calm duty cycle assembling one takes over a minute anyway. A disarmed phone now introduces itself whatever it is doing, and meeting a new phone buys 25 s of fast radio at both ends, so names arrive in seconds. **(e) Leaving a group stopped the app updating** until it was restarted, because the service cleared the Flutter bridge's snapshot listener on shutdown and nothing put it back — which is why creating the next group reported Bluetooth as off. The listener belongs to the bridge; the UI also no longer claims the radio is off merely because it has not heard yet. **(f) Rejoining a group looked like a replay attack**: the sequence counter was reset when the group changed, but the device id is derived from the secret and the install id, so the same device came back with a lower number and had its commands discarded. The counter is never reset now, and receivers follow it on every beacon rather than only on commands. **(g) First run and groups are separate screens.** Leaving a group used to reopen the four-step wizard — welcome, a name already set, a PIN and a permissions walkthrough long since done. The wizard is two steps and runs once; creating or joining a group is its own screen, shown whenever there is no group. The PIN moved to Settings ▸ Disarming. |
 | 1.4.0 | Two-phone field test. **(a) No phone had ever seen another phone.** The scanner filtered on a *service UUID*, while the beacon carries its payload as *service data* and nothing else. `ScanRecord.getServiceUuids()` is populated only from the service-UUID list AD types, never from service data, and the framework applies that filter in software regardless of what the controller offloads — so the filter matched no packet at all, on every device, since the first commit. Both radios worked perfectly and the mesh simply never formed; with one phone there is nothing to notice. The filter now matches service data, keyed on the version byte so foreign traffic is still rejected in hardware. Two counters — packets heard, and how many of those authenticated as this group — are now on the home screen, because "nothing is arriving" and "things arrive and are discarded" are different faults that look identical from an empty group list. The capability check for advertising was also over-strict: it used `isMultipleAdvertisementSupported`, which answers whether *several* sets can run at once, so phones that can advertise perfectly well were refusing to. **(b) The guard now stops when the app is closed.** It used to outlive the app deliberately; an ongoing notification for an app with no window is indistinguishable from one that will not go away. Swiping BeachProtect out of Recents shuts the radios, the wake lock, the heartbeat and both notifications down in order, a sticky restart with no task in Recents stands down rather than reposting the notification, and the boot receiver is gone. An alarm already sounding is the one exception: it finishes first, so a siren cannot be silenced by flicking a card off the Recents screen. |

@@ -368,8 +368,19 @@ interface EngineListener {
     /** Stop the siren locally. */
     fun onAlarmCleared()
 
-    /** Put [eventType] into the outgoing beacon's event slot. */
-    fun onBroadcastEvent(eventType: Int, subjectId: Int)
+    /**
+     * An alarm has just been decided *here*; put it on the air immediately.
+     *
+     * Deliberately not a queued, repeating message. The alarm event is derived
+     * from the guard's live state on every beacon (`BeaconComposer.chooseEvent`),
+     * so it leaves the air the moment the alarm does. Queuing it as well — which
+     * is what used to happen, through the same path as a group command — meant a
+     * phone kept broadcasting "theft!" for the whole repeat window *after* its
+     * siren had been silenced, so every other phone heard an incident that no
+     * longer existed. This callback only asks for the next beacon to go out now
+     * rather than at the next tick.
+     */
+    fun onAlarmAnnounced(eventType: Int, subjectId: Int)
 
     /**
      * Pass a group command on to the rest of the group.
@@ -384,8 +395,11 @@ interface EngineListener {
      *
      * @param originId the device that *issued* the command, carried unchanged
      *        through every relay so all copies are recognisable as one command.
+     * @param counter which press of that device's button this is, likewise
+     *        carried unchanged. Together with [originId] it is what lets a stale
+     *        copy be told from a genuine second press.
      */
-    fun onRelayGroupCommand(eventType: Int, originId: Int)
+    fun onRelayGroupCommand(eventType: Int, originId: Int, counter: Int)
 
     /**
      * A peer's display name has been fully reassembled from its beacons.

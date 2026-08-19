@@ -294,8 +294,12 @@ class GuardService : Service(),
      */
     private fun announceGroupCommand(eventType: Int) {
         val now = now()
-        engine.noteOwnGroupCommand(now, eventType)
-        composer.queueControl(now, eventType, store.deviceId)
+        // One counter per press, persisted and monotonic. It is what makes this
+        // decision distinguishable from the last one of the same kind - see
+        // ThreatEngine.commandCounters for why that is not optional.
+        val counter = store.nextCommandCounter()
+        engine.noteOwnGroupCommand(counter)
+        composer.queueControl(now, eventType, store.deviceId, counter)
         advertiser.updatePayload(composeBeacon())
         restartRadios()
     }
@@ -319,6 +323,20 @@ class GuardService : Service(),
      * wake lock and the heartbeat alarm down in an orderly way.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
+        // Android delivers this for *any* task belonging to the app, not only
+        // the one the user swiped. The lock-screen alarm surface runs in a task
+        // of its own, so tidying it away used to read here as "the app was
+        // closed" and shut the guard down mid-incident - radios off, queued
+        // group command never transmitted, and the phone gone from everybody
+        // else's mesh until somebody opened the app again. Only the task rooted
+        // at the app's own window counts.
+        val root = rootIntent?.component?.className
+        if (root != null && root != MainActivity::class.java.name) {
+            Log.i(TAG, "auxiliary task removed ($root); the guard keeps running")
+            super.onTaskRemoved(rootIntent)
+            return
+        }
+
         Log.i(TAG, "task removed; state=${engine.state}")
         if (engine.state == GuardState.ALARM || engine.state == GuardState.PENDING) {
             stopWhenIdle = true
@@ -565,11 +583,7 @@ class GuardService : Service(),
         // thing to silence; see ThreatEngine.alarmOriginatedHere.
         val alarming = engine.state == GuardState.ALARM &&
             engine.alarmOriginatedHere && !rehearsing
-        val alarmEvent = if (engine.alarmReason == AlarmReason.BOX_TAKEN) {
-            Protocol.EVENT_BOX_ALARM
-        } else {
-            Protocol.EVENT_ALARM
-        }
+        val alarmEvent = engine.selfAlarmEvent()
         var flags = engine.selfFlags()
         // Likewise for the flag: a rehearsing phone must not show up as
         // "alarming" on everybody else's group list.
@@ -698,6 +712,16 @@ class GuardService : Service(),
 
         acquireWakeLock()
 
+        // A queued "everybody stop" is now about a different incident, and this
+        // phone would go on transmitting it right through the one that has just
+        // started - telling the group to silence a siren seconds after it began.
+        // (It has to be here rather than alongside the announcement: a phone
+        // that merely joins in never announces anything, and it is just as
+        // capable of holding a stale "stop" in its slot.)
+        if (composer.pendingControlEvent == Protocol.EVENT_ALARM_CLEAR) {
+            composer.clearControl()
+        }
+
         val boxAddress = store.boxAddress.takeIf { store.boxEnabled && boxGuard.guardingHere }
         alarmPlayer.start(
             reason = reason,
@@ -724,19 +748,25 @@ class GuardService : Service(),
         broadcastUpdate(engine.state, null, Protocol.DEVICE_ID_NONE, null, 0)
     }
 
-    override fun onBroadcastEvent(eventType: Int, subjectId: Int) {
+    override fun onAlarmAnnounced(eventType: Int, subjectId: Int) {
         // A rehearsal stays on this phone. Telling the group would set off
         // everybody else's siren for a test.
         if (rehearsing) return
-        composer.queueControl(now(), eventType, subjectId)
+        // Deliberately *not* queued as a repeating control message. The alarm
+        // rides on the guard's live state in every beacon and stops with it;
+        // queuing it as well is what left phones broadcasting an incident that
+        // had already been called off. All this does is get the first one out
+        // without waiting for the next tick.
         advertiser.updatePayload(composeBeacon())
     }
 
-    override fun onRelayGroupCommand(eventType: Int, originId: Int) {
+    override fun onRelayGroupCommand(eventType: Int, originId: Int, counter: Int) {
         if (rehearsing) return
-        // The origin id travels unchanged, so every copy of the command stays
-        // recognisable as one decision and the flood terminates.
-        composer.queueControl(now(), eventType, originId, BeaconComposer.CONTROL_RELAY_MS)
+        // Origin and counter travel unchanged, so every copy of the command stays
+        // recognisable as one press and the flood terminates.
+        composer.queueControl(
+            now(), eventType, originId, counter, BeaconComposer.CONTROL_RELAY_MS,
+        )
         advertiser.updatePayload(composeBeacon())
         scheduleTick(immediate = true)
     }

@@ -696,7 +696,7 @@ class ThreatEngineTest {
         // A genuine "everybody disarm" from packing-up time.
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_A, seq = 40, eventType = Protocol.EVENT_DISARM_ALL),
+            command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 9, seq = 40),
         )
         assertEquals(GuardState.DISARMED, h.engine.state)
 
@@ -704,7 +704,7 @@ class ThreatEngineTest {
         h.engine.arm(h.now)
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_A, seq = 40, eventType = Protocol.EVENT_DISARM_ALL),
+            command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 9, seq = 40),
         )
 
         assertNotEquals(
@@ -857,7 +857,7 @@ class ThreatEngineTest {
 
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_A, seq = 11, eventType = Protocol.EVENT_DISARM_ALL),
+            command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 4, seq = 11),
         )
         assertEquals(GuardState.DISARMED, h.engine.state)
 
@@ -887,7 +887,7 @@ class ThreatEngineTest {
 
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_A, seq = 30, eventType = Protocol.EVENT_DISARM_ALL),
+            command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 2, seq = 30),
         )
         assertEquals(GuardState.DISARMED, h.engine.state)
 
@@ -916,7 +916,7 @@ class ThreatEngineTest {
 
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_A, seq = 100, eventType = Protocol.EVENT_ALARM_CLEAR),
+            command(PEER_A, Protocol.EVENT_ALARM_CLEAR, counter = 1, seq = 100),
         )
 
         // Hours of ordinary beacons: twenty thousand sequence numbers, which is
@@ -931,7 +931,7 @@ class ThreatEngineTest {
         seq = (seq + 1) and 0xFFFF
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_A, seq = seq, eventType = Protocol.EVENT_DISARM_ALL),
+            command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 2, seq = seq),
         )
         assertEquals(GuardState.DISARMED, h.engine.state)
     }
@@ -955,10 +955,8 @@ class ThreatEngineTest {
         // PEER_B decided this; we heard it from PEER_A, who was relaying.
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(
-                PEER_A, armed = false, seq = 5,
-                eventType = Protocol.EVENT_ARM_ALL, subjectId = PEER_B,
-            ),
+            command(PEER_A, Protocol.EVENT_ARM_ALL, origin = PEER_B, counter = 3, seq = 5,
+                armed = false),
         )
 
         assertEquals(GuardState.CALIBRATING, h.engine.state)
@@ -971,7 +969,7 @@ class ThreatEngineTest {
         // flood that never terminates.
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(PEER_C, seq = 6, eventType = Protocol.EVENT_ARM_ALL, subjectId = PEER_B),
+            command(PEER_C, Protocol.EVENT_ARM_ALL, origin = PEER_B, counter = 3, seq = 6),
         )
         assertEquals("relayed exactly once", 1, h.recorder.relays.size)
     }
@@ -982,7 +980,7 @@ class ThreatEngineTest {
         h.armAndCalibrate()
 
         // This phone told everybody to stand down, and stood itself down...
-        h.engine.noteOwnGroupCommand(h.now, Protocol.EVENT_DISARM_ALL)
+        h.engine.noteOwnGroupCommand(6)
         h.engine.disarm(h.now, groupWide = true)
         // ...and then thought better of it.
         h.engine.arm(h.now)
@@ -992,9 +990,9 @@ class ThreatEngineTest {
         h.advance(20_000, stepMs = 1_000) { t ->
             h.engine.onPeerBeacon(
                 t, -60,
-                beacon(
-                    PEER_A, seq = ++seq,
-                    eventType = Protocol.EVENT_DISARM_ALL, subjectId = SELF_ID,
+                command(
+                    PEER_A, Protocol.EVENT_DISARM_ALL,
+                    origin = SELF_ID, counter = 6, seq = ++seq,
                 ),
             )
         }
@@ -1018,10 +1016,7 @@ class ThreatEngineTest {
 
         h.engine.onPeerBeacon(
             h.now, -60,
-            beacon(
-                PEER_A, seq = 20,
-                eventType = Protocol.EVENT_DISARM_ALL, subjectId = PEER_A,
-            ),
+            command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 5, seq = 20),
         )
         assertEquals(GuardState.DISARMED, h.engine.state)
 
@@ -1031,14 +1026,89 @@ class ThreatEngineTest {
         h.advance(20_000, stepMs = 1_000) { t ->
             h.engine.onPeerBeacon(
                 t, -60,
-                beacon(
-                    PEER_B, seq = ++seq,
-                    eventType = Protocol.EVENT_DISARM_ALL, subjectId = PEER_A,
+                command(
+                    PEER_B, Protocol.EVENT_DISARM_ALL,
+                    origin = PEER_A, counter = 5, seq = ++seq,
                 ),
             )
         }
 
         assertNotEquals(GuardState.DISARMED, h.engine.state)
+    }
+
+    /**
+     * Regression test for the sequence anybody testing the app performs within
+     * the first minute: arm everyone, watch it work, stand everyone down, arm
+     * everyone again.
+     *
+     * Remembering commands by *type* for a while — which is what the first
+     * version of the relay did, to stop a circulating copy re-applying itself —
+     * made the third press a no-op on every phone that had heard the first. The
+     * counter is what separates "the same message again" from "the same button
+     * again".
+     */
+    @Test
+    fun `pressing the same button again is obeyed`() {
+        val h = Harness()
+        h.settle()
+
+        h.engine.onPeerBeacon(
+            h.now, -60, command(PEER_A, Protocol.EVENT_ARM_ALL, counter = 1, seq = 1),
+        )
+        assertNotEquals(GuardState.DISARMED, h.engine.state)
+
+        h.engine.onPeerBeacon(
+            h.now, -60, command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 2, seq = 2),
+        )
+        assertEquals(GuardState.DISARMED, h.engine.state)
+
+        h.engine.onPeerBeacon(
+            h.now, -60, command(PEER_A, Protocol.EVENT_ARM_ALL, counter = 3, seq = 3),
+        )
+        assertNotEquals(
+            "the third press is a new decision, not an echo of the first",
+            GuardState.DISARMED, h.engine.state,
+        )
+    }
+
+    /**
+     * ...and the other half of the same coin: a copy of an *older* press, which
+     * is what a relay still circulating half a minute later is, must not undo
+     * what has happened since.
+     */
+    @Test
+    fun `a stale copy of an older command is ignored`() {
+        val h = Harness()
+        h.settle()
+
+        h.engine.onPeerBeacon(
+            h.now, -60, command(PEER_A, Protocol.EVENT_DISARM_ALL, counter = 7, seq = 1),
+        )
+        h.engine.onPeerBeacon(
+            h.now, -60, command(PEER_A, Protocol.EVENT_ARM_ALL, counter = 8, seq = 2),
+        )
+        assertNotEquals(GuardState.DISARMED, h.engine.state)
+
+        // A phone that only now got round to passing the older one on.
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            command(PEER_B, Protocol.EVENT_DISARM_ALL, origin = PEER_A, counter = 7, seq = 3),
+        )
+
+        assertNotEquals(GuardState.DISARMED, h.engine.state)
+        assertEquals(
+            "and it must not be passed on a second time either",
+            1, h.recorder.relays.count { it.first == Protocol.EVENT_DISARM_ALL },
+        )
+    }
+
+    @Test
+    fun `command counters wrap around`() {
+        assertTrue(Protocol.isNewerCommand(5, 4))
+        assertTrue("the counter is one byte", Protocol.isNewerCommand(0, 255))
+        assertFalse(Protocol.isNewerCommand(4, 5))
+        assertFalse(Protocol.isNewerCommand(255, 0))
+        assertFalse("the same press is not a new one", Protocol.isNewerCommand(9, 9))
     }
 
     // =====================================================================
@@ -1087,6 +1157,53 @@ class ThreatEngineTest {
 
         assertFalse(h.recorder.alarmed)
         assertTrue(h.engine.activeVotes(h.now).isEmpty())
+    }
+
+    /**
+     * An accusation has to be withdrawn the moment it is disproved.
+     *
+     * A LOST vote used to survive the peer's return for the whole eight second
+     * vote lifetime, because the code path that noticed the peer was back
+     * skipped straight past the retraction whenever its baseline had been reset.
+     * A second observer agreeing with a withdrawn accusation is a siren about a
+     * phone lying on the towel.
+     */
+    @Test
+    fun `a lost vote is withdrawn as soon as the peer is heard again`() {
+        val h = Harness()
+        // Enough phones that one voice is not consensus, so the accusation can
+        // be inspected instead of instantly becoming a siren.
+        h.armAndCalibrate(peerIds = listOf(PEER_B, PEER_C, PEER_D))
+        val others = listOf(PEER_B, PEER_C, PEER_D)
+
+        // PEER_A turns up late and is never lying still, so it never earns a
+        // baseline - which is precisely the state the retraction was skipped in.
+        h.advance(2_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, stationary = false, motionScore = 5))
+            others.forEach { h.engine.onPeerBeacon(t, -60, beacon(it)) }
+        }
+
+        // ...and then goes quiet.
+        h.advance(16_000, stepMs = 500) { t ->
+            others.forEach { h.engine.onPeerBeacon(t, -60, beacon(it)) }
+        }
+        assertTrue(
+            "it should have been reported missing by now",
+            h.engine.activeVotes(h.now)
+                .any { it.first == Protocol.EVENT_LOST && it.second == PEER_A },
+        )
+        assertFalse("but one voice is not consensus here", h.recorder.alarmed)
+
+        // It was behind a cool box, not in a thief's pocket.
+        h.advance(2_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, stationary = false, motionScore = 5))
+            others.forEach { h.engine.onPeerBeacon(t, -60, beacon(it)) }
+        }
+
+        assertTrue(
+            "the accusation has to be taken back the moment it is disproved",
+            h.engine.activeVotes(h.now).none { it.second == PEER_A },
+        )
     }
 
     @Test

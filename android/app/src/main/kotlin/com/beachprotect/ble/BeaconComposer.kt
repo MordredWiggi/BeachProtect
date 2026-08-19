@@ -1,6 +1,21 @@
 package com.beachprotect.ble
 
-import com.beachprotect.store.GuardStore
+/**
+ * The identity and sequence state a beacon needs.
+ *
+ * Narrowed to an interface purely so [BeaconComposer] can be exercised by plain
+ * JUnit: what goes into the event slot, and — much more to the point — what
+ * *stops* going into it when an incident ends, is a rule worth a test rather
+ * than a field trip. `GuardStore` is the real implementation.
+ */
+interface BeaconSource {
+    val groupId: Int
+    val deviceId: Int
+    val groupKey: ByteArray
+    val txPowerRef: Int
+    val sequenceBlockSize: Int
+    fun beginSequenceBlock(): Int
+}
 
 /**
  * Decides what goes into the single event slot of each outgoing beacon.
@@ -11,13 +26,14 @@ import com.beachprotect.store.GuardStore
  * tier. Nothing is ever sent "extra": the beacon goes out anyway, this only
  * chooses its contents.
  */
-class BeaconComposer(private val store: GuardStore) {
+class BeaconComposer(private val store: BeaconSource) {
 
     private var sequence = 0
     private var sequenceLimit = 0
 
     private var controlEvent: Int = Protocol.EVENT_NONE
     private var controlSubject: Int = Protocol.DEVICE_ID_NONE
+    private var controlCounter: Int = 0
     private var controlUntil: Long = 0
 
     private var voteCursor = 0
@@ -35,10 +51,12 @@ class BeaconComposer(private val store: GuardStore) {
         now: Long,
         eventType: Int,
         subjectId: Int,
+        commandCounter: Int,
         durationMs: Long = CONTROL_REPEAT_MS,
     ) {
         controlEvent = eventType
         controlSubject = subjectId
+        controlCounter = commandCounter
         controlUntil = now + durationMs
         controlAlternates = false
     }
@@ -47,9 +65,13 @@ class BeaconComposer(private val store: GuardStore) {
     fun controlPending(now: Long): Boolean =
         now < controlUntil && controlEvent != Protocol.EVENT_NONE
 
+    /** What is queued, so a caller can tell whether it has been superseded. */
+    val pendingControlEvent: Int get() = controlEvent
+
     fun clearControl() {
         controlEvent = Protocol.EVENT_NONE
         controlSubject = Protocol.DEVICE_ID_NONE
+        controlCounter = 0
         controlUntil = 0
     }
 
@@ -74,6 +96,17 @@ class BeaconComposer(private val store: GuardStore) {
     private fun chooseEvent(input: Input): Triple<Int, Int, Int?> {
         // 1. An active alarm outranks everything and is repeated continuously,
         //    because a phone that joins late still has to start screaming.
+        //
+        //    Note what this is *not*: a queued control message. The alarm is
+        //    derived from the guard's live state on every single beacon, so it
+        //    leaves the air the instant the alarm does. Queuing it - which is
+        //    what used to happen alongside this, through the same path as a
+        //    group command - meant a phone went on shouting "theft!" for the
+        //    full repeat window after its siren had been silenced. Every other
+        //    phone heard an incident that no longer existed: the group-alarm
+        //    banner came back by itself, and once the echo window lapsed a phone
+        //    could be dragged into a real siren by a packet describing something
+        //    that had ended half a minute earlier.
         if (input.alarming) {
             return Triple(input.alarmEvent, input.alarmSubject, null)
         }
@@ -90,7 +123,10 @@ class BeaconComposer(private val store: GuardStore) {
         if (controlPending(input.now)) {
             controlAlternates = !controlAlternates
             if (controlAlternates || input.votes.isEmpty()) {
-                return Triple(controlEvent, controlSubject, null)
+                // The counter rides in the motion-score byte, which is what
+                // makes this copy identifiable as one particular press of one
+                // particular button rather than merely "a disarm-all".
+                return Triple(controlEvent, controlSubject, controlCounter)
             }
         }
 
@@ -154,7 +190,7 @@ class BeaconComposer(private val store: GuardStore) {
          * phone that hears a command passes it on (see
          * `EngineListener.onRelayGroupCommand`).
          */
-        const val CONTROL_REPEAT_MS = 30_000L
+        const val CONTROL_REPEAT_MS = 25_000L
 
         /**
          * How long a phone repeats somebody *else's* command.
@@ -164,6 +200,6 @@ class BeaconComposer(private val store: GuardStore) {
          * whole group holding its radios up for half a minute each would turn one
          * button press into a measurable dent in the afternoon.
          */
-        const val CONTROL_RELAY_MS = 10_000L
+        const val CONTROL_RELAY_MS = 6_000L
     }
 }

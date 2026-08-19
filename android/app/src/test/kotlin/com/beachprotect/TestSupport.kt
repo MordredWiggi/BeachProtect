@@ -20,6 +20,9 @@ class Recorder : EngineListener {
     /** Group commands this phone was asked to pass on: event type to origin. */
     val relays = mutableListOf<Pair<Int, Int>>()
 
+    /** ...and the command counter each of those carried. */
+    val relayCounters = mutableListOf<Int>()
+
     /** Peer names fully reassembled from beacons: device id to name. */
     val learnedNames = mutableListOf<Pair<Int, String>>()
     var clearedCount = 0
@@ -47,12 +50,13 @@ class Recorder : EngineListener {
         clearedCount++
     }
 
-    override fun onBroadcastEvent(eventType: Int, subjectId: Int) {
+    override fun onAlarmAnnounced(eventType: Int, subjectId: Int) {
         broadcasts += eventType to subjectId
     }
 
-    override fun onRelayGroupCommand(eventType: Int, originId: Int) {
+    override fun onRelayGroupCommand(eventType: Int, originId: Int, counter: Int) {
         relays += eventType to originId
+        relayCounters += counter
     }
 
     override fun onPeerNameLearned(deviceId: Int, name: String) {
@@ -156,6 +160,29 @@ fun sendName(h: Harness, deviceId: Int, name: String, armed: Boolean = true) {
         )
     }
 }
+
+/**
+ * A group command as it actually appears on the wire.
+ *
+ * The counter is the whole point: it identifies one *press*, so a stale relay
+ * and a genuine second press of the same button can be told apart. It rides in
+ * the motion-score byte, exactly as name chunks ride in the subject field.
+ */
+fun command(
+    from: Int,
+    eventType: Int,
+    origin: Int = from,
+    counter: Int = 1,
+    seq: Int = 1,
+    armed: Boolean = true,
+): Beacon = beacon(
+    from,
+    armed = armed,
+    seq = seq,
+    eventType = eventType,
+    subjectId = origin,
+    motionScore = counter,
+)
 
 /** Builds a decoded beacon without going through crypto. */
 fun beacon(

@@ -2,6 +2,7 @@ package com.beachprotect.store
 
 import android.content.Context
 import android.util.Base64
+import com.beachprotect.ble.BeaconSource
 import com.beachprotect.ble.Protocol
 import com.beachprotect.guard.AlarmTarget
 import com.beachprotect.guard.DisarmMode
@@ -21,7 +22,7 @@ import java.util.UUID
  * channel rather than keeping its own copy, because the guard has to keep
  * working correctly long after the Flutter engine has been torn down.
  */
-class GuardStore(context: Context) {
+class GuardStore(context: Context) : BeaconSource {
 
     private val prefs = context.applicationContext
         .getSharedPreferences("beachprotect", Context.MODE_PRIVATE)
@@ -68,9 +69,9 @@ class GuardStore(context: Context) {
         set(value) = prefs.edit()
             .putString(KEY_SELF_NAME, Protocol.normaliseName(value)).apply()
 
-    val groupId: Int get() = groupSecret?.let { Protocol.groupIdOf(it) } ?: 0
-    val groupKey: ByteArray get() = groupSecret?.let { Protocol.groupKeyOf(it) } ?: ByteArray(32)
-    val deviceId: Int
+    override val groupId: Int get() = groupSecret?.let { Protocol.groupIdOf(it) } ?: 0
+    override val groupKey: ByteArray get() = groupSecret?.let { Protocol.groupKeyOf(it) } ?: ByteArray(32)
+    override val deviceId: Int
         get() = groupSecret?.let { Protocol.deviceIdOf(it, installId) } ?: 0
 
     val groupCode: String? get() = groupSecret?.let { Protocol.encodeGroupCode(it) }
@@ -141,14 +142,30 @@ class GuardStore(context: Context) {
      * *end* of a block up front and hand out numbers from memory. A crash
      * simply burns the rest of the block.
      */
-    fun beginSequenceBlock(): Int {
+    override fun beginSequenceBlock(): Int {
         val base = prefs.getInt(KEY_SEQ, 0)
         prefs.edit().putInt(KEY_SEQ, base + SEQ_BLOCK).apply()
         return base
     }
 
     /** Size of a reserved block; about an hour of beaconing. */
-    val sequenceBlockSize: Int get() = SEQ_BLOCK
+    override val sequenceBlockSize: Int get() = SEQ_BLOCK
+
+    /**
+     * The next group-command counter, wrapping at a byte.
+     *
+     * Identifies one press of one button. Persisted — one write per press, which
+     * is nothing — because it has to keep climbing across restarts: a phone that
+     * came back at zero would have its next hundred-odd commands read as stale by
+     * everyone who still remembered the old number. (Clearing app data resets it,
+     * but that also changes the install id and therefore the device id, so it
+     * comes back as a device nobody has heard of.)
+     */
+    fun nextCommandCounter(): Int {
+        val next = (prefs.getInt(KEY_COMMAND_COUNTER, 0) + 1) and 0xFF
+        prefs.edit().putInt(KEY_COMMAND_COUNTER, next).apply()
+        return next
+    }
 
     // ---- disarm authentication -------------------------------------------
 
@@ -248,7 +265,7 @@ class GuardStore(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_ONBOARDED, value).apply()
 
     /** Calibrated RSSI at one metre, broadcast so peers can estimate distance. */
-    var txPowerRef: Int
+    override var txPowerRef: Int
         get() = prefs.getInt(KEY_TX_POWER_REF, -59)
         set(value) = prefs.edit().putInt(KEY_TX_POWER_REF, value.coerceIn(-100, -20)).apply()
 
@@ -436,6 +453,7 @@ class GuardStore(context: Context) {
         private const val KEY_GROUP_NAME = "group_name"
         private const val KEY_SELF_NAME = "self_name"
         private const val KEY_SEQ = "seq"
+        private const val KEY_COMMAND_COUNTER = "command_counter"
         private const val KEY_DISARM_MODE = "disarm_mode"
         private const val KEY_PIN_HASH = "pin_hash"
         private const val KEY_PIN_SALT = "pin_salt"
