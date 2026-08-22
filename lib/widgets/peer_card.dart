@@ -11,19 +11,34 @@ class PeerCard extends StatelessWidget {
   final PeerInfo peer;
   final VoidCallback? onRename;
 
+  /// An annotation rather than a state.
+  ///
+  /// "Not heard for 7s" tells you the link is having a moment without claiming
+  /// anything has changed about the phone, which is the honest reading: at the
+  /// calm duty cycle the scanner is listening about a quarter of the time, so
+  /// gaps this long are the radio's business and not the group's.
+  String get _faintSuffix =>
+      peer.faint ? ' · not heard for ${(peer.lastSeenMsAgo / 1000).round()}s' : '';
+
   @override
   Widget build(BuildContext context) {
     final status = context.status;
     final Color tint;
     final String stateLine;
 
-    // Staleness is tested *first*, and that ordering is the fix rather than a
-    // tidy-up. Everything below it — alarming, suspected, armed — is read off
-    // the last beacon this phone happened to catch, so a peer that has gone
-    // quiet was being rendered with whatever it last said: "Alarming" for
-    // minutes after an incident was over, "Not guarding" from a beacon caught
-    // mid-rearm. Silence is its own state, and it outranks memories.
-    if (peer.stale) {
+    // Being properly lost is tested first, and outranks every memory: a phone
+    // nobody has heard from in half a minute must not go on being rendered as
+    // whatever it last said — "Alarming" for minutes after an incident was over,
+    // "Not guarding" from a beacon caught mid-rearm.
+    //
+    // A peer that is merely *faint* deliberately falls through to exactly the
+    // line it would have had anyway, with a note appended. That is the whole fix
+    // for the flickering group list. Silence long enough to notice is a normal
+    // event on a duty-cycled radio — a run of missed scan windows, several times
+    // an hour — and treating it as a state of its own meant every one of those
+    // repainted the card green-to-grey and straight back. The reader cannot tell
+    // that apart from the group genuinely changing its mind twice a second.
+    if (peer.lost) {
       tint = status.disarmed;
       stateLine = 'No signal for ${(peer.lastSeenMsAgo / 1000).round()}s';
     } else if (peer.alarming) {
@@ -36,10 +51,11 @@ class PeerCard extends StatelessWidget {
           : 'Moving away';
     } else if (!peer.armed) {
       tint = status.disarmed;
-      stateLine = 'Not guarding';
+      stateLine = 'Not guarding$_faintSuffix';
     } else {
       tint = status.armed;
-      stateLine = peer.stationary ? 'Still, watched' : 'Moving';
+      stateLine =
+          '${peer.stationary ? 'Still, watched' : 'Moving'}$_faintSuffix';
     }
 
     return Card(
@@ -61,7 +77,7 @@ class PeerCard extends StatelessWidget {
                       shape: BoxShape.circle,
                     ),
                     child: Icon(
-                      peer.stale
+                      peer.lost
                           ? Icons.signal_cellular_off_rounded
                           : peer.alarming
                               ? Icons.warning_rounded
@@ -147,16 +163,17 @@ class PeerCard extends StatelessWidget {
                       color: status.calibrating,
                       emphasise: true,
                     ),
-                  // Both of these describe the last packet we caught, so they
-                  // are hidden the moment that packet stops being current.
-                  if (!peer.stale && peer.dropDb != null && peer.dropDb! > 3)
+                  // Both of these are readings rather than states, so they go
+                  // once the reading behind them stops being current — which is
+                  // a different and stricter question than what the card says.
+                  if (peer.current && peer.dropDb != null && peer.dropDb! > 3)
                     InfoChip(
                       icon: Icons.trending_down_rounded,
                       label: '-${peer.dropDb!.toStringAsFixed(0)} dB',
                       color: peer.dropDb! > 10 ? status.suspicious : null,
                       emphasise: peer.dropDb! > 10,
                     ),
-                  if (!peer.stale && !peer.stationary)
+                  if (peer.current && !peer.stationary)
                     InfoChip(
                       icon: Icons.vibration_rounded,
                       label: 'in motion',

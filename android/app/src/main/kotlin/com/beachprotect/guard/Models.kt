@@ -21,6 +21,34 @@ enum class GuardState {
     ALARM,
 }
 
+/**
+ * How well we can currently hear one group member.
+ *
+ * Deliberately three states and not a boolean, and deliberately decided in the
+ * engine rather than in the UI. A boolean "is this peer's telemetry current?"
+ * is a single hard edge, and a single hard edge on a duty-cycled radio flaps:
+ * the calm scanner listens about a quarter of the time, so a run of missed
+ * windows adding up to the threshold happens regularly, and every one of them
+ * repainted the whole card — green "still, watched" to grey and straight back.
+ * That is what the group list flickering "seemingly at random" actually was.
+ *
+ * [MISSING] is the dead band. It says "we have not heard from this phone for
+ * longer than usual", which is worth *annotating* the card with and worth
+ * spending fast radio on, but it is not news and must not repaint anything.
+ * Only [LOST] — a silence far longer than any duty cycle explains — changes what
+ * the card says.
+ */
+enum class PeerPresence {
+    /** Heard recently enough that everything else we know about it is current. */
+    PRESENT,
+
+    /** Quiet for longer than usual. Probably a missed scan window; watch harder. */
+    MISSING,
+
+    /** Quiet for long enough that silence is the story, not the telemetry. */
+    LOST,
+}
+
 /** How hard the radios are being driven. Drives the whole energy story. */
 enum class RadioProfile {
     /** Idle patrol: slow scan, slow advertising. */
@@ -281,25 +309,28 @@ data class PeerSnapshot(
     val lastSeenMsAgo: Long,
 
     /**
-     * True when this peer has been silent for longer than is normal *for the
-     * current scan duty cycle*, so none of the telemetry above should be read
-     * as current.
+     * How well this peer is currently being heard.
      *
-     * Decided here rather than in the UI on purpose. The UI used to apply its
-     * own fixed eight second rule, which at the calm profile is shorter than an
-     * ordinary gap between two scan results — so a phone lying on the same towel
-     * flipped between "still, watched" and "no signal" once a second, and after
-     * an incident it went on showing a stale "alarming" flag for minutes. One
-     * threshold, computed where the arrival times are known.
+     * Decided here rather than in the UI on purpose, and as three states rather
+     * than one boolean — see [PeerPresence] for why the boolean was the bug.
      */
-    val linkStale: Boolean,
+    val presence: PeerPresence,
 
-    /** The threshold behind [linkStale], so the UI can say how long it has been. */
+    /** How long silence has to run before [presence] leaves [PeerPresence.PRESENT]. */
     val staleAfterMs: Long,
     val suspected: Boolean,
     val votesAgainst: Int,
     val votesRequired: Int,
-)
+) {
+    /**
+     * Whether the telemetry above is current enough to reason about.
+     *
+     * Note that this is *not* the same question as what to show the user: a
+     * [PeerPresence.MISSING] peer is not current, but its card must keep saying
+     * what it last said, because the alternative is a list that flickers.
+     */
+    val current: Boolean get() = presence == PeerPresence.PRESENT
+}
 
 /** Immutable view of the guarded speaker box. */
 data class BoxSnapshot(
@@ -353,6 +384,26 @@ data class GuardSnapshot(
      * this phone is.
      */
     val groupAlarmActive: Boolean,
+
+    /**
+     * True while this phone is still telling the group to stop, or to stand
+     * down, and somebody has not confirmed yet.
+     *
+     * The banner used to be binary — "the group is still alarming" — and it was
+     * driven by a twelve second memory of the last alarm packet heard, refreshed
+     * by *any* alarming beacon including echoes of the very incident the user had
+     * just called off. So it appeared, aged out, and reappeared on the next
+     * straggler, over and over, about an incident that was finished. With
+     * acknowledgements the phone knows the actual answer, so it says the actual
+     * answer instead.
+     */
+    val stopPending: Boolean,
+
+    /** How many of [stopExpected] phones have confirmed the outstanding stop. */
+    val stopConfirmed: Int,
+
+    /** How many phones this one can currently hear, and is therefore waiting on. */
+    val stopExpected: Int,
     val peers: List<PeerSnapshot>,
     val box: BoxSnapshot,
     val warnings: Set<GuardWarning>,
@@ -385,21 +436,31 @@ interface EngineListener {
     /**
      * Pass a group command on to the rest of the group.
      *
-     * Group commands have no acknowledgement and travel to phones that are
-     * listening a fraction of the time, so the phone that issued one is not a
-     * good enough sole source: in a three-phone group the far phone may hear
-     * nobody but the middle one. Every phone therefore re-broadcasts a command
-     * the first time it sees it, which turns a single burst into an epidemic that
-     * reaches everyone in range of *anyone*. It terminates because a command is
-     * relayed only on first sight ([ThreatEngine.COMMAND_MEMORY_MS]).
+     * Group commands travel to phones that are listening a fraction of the time,
+     * so the phone that issued one is not a good enough sole source: in a
+     * three-phone group the far phone may hear nobody but the middle one. Every
+     * phone therefore re-broadcasts a command the first time it sees it, which
+     * turns a single burst into an epidemic that reaches everyone in range of
+     * *anyone*. It terminates because a copy that is not newer is not passed on.
      *
      * @param originId the device that *issued* the command, carried unchanged
      *        through every relay so all copies are recognisable as one command.
      * @param counter which press of that device's button this is, likewise
      *        carried unchanged. Together with [originId] it is what lets a stale
-     *        copy be told from a genuine second press.
+     *        copy be told from a genuine second press — and what the receiving
+     *        phone acknowledges.
      */
     fun onRelayGroupCommand(eventType: Int, originId: Int, counter: Int)
+
+    /**
+     * A peer has announced that it is leaving the group, and has been dropped.
+     *
+     * Worth telling the host about so anything keyed by device id — nicknames,
+     * learned names — goes with it. Device ids are derived from the group secret,
+     * so a departed id means nothing afterwards and would only be waiting to be
+     * attached to the wrong phone later.
+     */
+    fun onPeerLeft(deviceId: Int)
 
     /**
      * A peer's display name has been fully reassembled from its beacons.

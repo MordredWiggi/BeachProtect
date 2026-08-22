@@ -42,6 +42,20 @@ extension GuardStateX on GuardState {
       };
 }
 
+/// How well this phone can currently hear one group member.
+///
+/// Three states rather than a boolean, and decided natively. A boolean "is this
+/// peer's telemetry current?" is a single hard edge, and a single hard edge on a
+/// duty-cycled radio flaps: the calm scanner listens about a quarter of the
+/// time, so a run of missed windows reaching the threshold is an ordinary event
+/// — and every one of them repainted the card, green to grey and straight back.
+/// That is what the group list "changing at random" actually was.
+///
+/// [missing] is the dead band. It is worth annotating a card with and worth
+/// spending fast radio on, but it is not news: the card goes on saying exactly
+/// what it said. Only [lost] changes anything.
+enum PeerPresence { present, missing, lost }
+
 enum RadioProfile { calm, alert, critical }
 
 extension RadioProfileX on RadioProfile {
@@ -145,7 +159,7 @@ class PeerInfo {
     required this.boxGuardian,
     required this.simulated,
     required this.lastSeenMsAgo,
-    required this.linkStale,
+    required this.presence,
     required this.staleAfterMs,
     required this.suspected,
     required this.votesAgainst,
@@ -169,16 +183,15 @@ class PeerInfo {
   final bool simulated;
   final int lastSeenMsAgo;
 
-  /// Whether this peer has been silent for longer than is normal at the scan
-  /// duty cycle currently in use — so nothing else on this record is current.
+  /// How well this peer is currently being heard; see [PeerPresence].
   ///
-  /// Decided natively, where the arrival times are known. The UI used to apply
-  /// its own flat eight second rule, which at the calm profile is shorter than
-  /// an ordinary gap between two scan results: a phone on the same towel
-  /// flickered between "still, watched" and "no signal" once a second.
-  final bool linkStale;
+  /// Decided natively, where the arrival times and the scan duty cycle are
+  /// known. The UI used to apply its own flat rule, which at the calm profile is
+  /// shorter than an ordinary gap between two scan results: a phone on the same
+  /// towel flickered between "still, watched" and "no signal" once a second.
+  final PeerPresence presence;
 
-  /// The threshold behind [linkStale].
+  /// How long silence has to run before [presence] leaves [PeerPresence.present].
   final int staleAfterMs;
   final bool suspected;
   final int votesAgainst;
@@ -189,7 +202,18 @@ class PeerInfo {
           ? name!.trim()
           : 'Phone ${deviceId.toRadixString(16).toUpperCase().padLeft(4, '0')}';
 
-  bool get stale => linkStale;
+  /// Whether the telemetry on this record is current enough to reason about.
+  ///
+  /// Deliberately not the same question as what to *show*: a [PeerPresence.missing]
+  /// peer keeps saying whatever it last said, because the alternative is a list
+  /// that flickers. Only [lost] replaces it.
+  bool get current => presence == PeerPresence.present;
+
+  /// Silent for long enough that silence is the story, not the telemetry.
+  bool get lost => presence == PeerPresence.lost;
+
+  /// Quiet for longer than usual, but well inside what a duty cycle explains.
+  bool get faint => presence == PeerPresence.missing;
 
   static PeerInfo fromMap(Map<Object?, Object?> map) => PeerInfo(
         deviceId: (map['deviceId'] as num?)?.toInt() ?? 0,
@@ -209,7 +233,8 @@ class PeerInfo {
         boxGuardian: map['boxGuardian'] as bool? ?? false,
         simulated: map['simulated'] as bool? ?? false,
         lastSeenMsAgo: (map['lastSeenMsAgo'] as num?)?.toInt() ?? 0,
-        linkStale: map['linkStale'] as bool? ?? false,
+        presence: _enumFrom(PeerPresence.values, map['presence'] as String?,
+            PeerPresence.present),
         staleAfterMs: (map['staleAfterMs'] as num?)?.toInt() ?? 12000,
         suspected: map['suspected'] as bool? ?? false,
         votesAgainst: (map['votesAgainst'] as num?)?.toInt() ?? 0,
@@ -401,6 +426,9 @@ class GuardSnapshot {
     required this.alarmSubjectId,
     required this.alarmSubjectName,
     required this.groupAlarmActive,
+    required this.stopPending,
+    required this.stopConfirmed,
+    required this.stopExpected,
     required this.peers,
     required this.box,
     required this.warnings,
@@ -432,6 +460,23 @@ class GuardSnapshot {
   /// else disappeared — replaced, absurdly, by "Arm all" — while the rest of the
   /// group carried on screaming.
   final bool groupAlarmActive;
+
+  /// Whether this phone is still telling the group to stop, or to stand down,
+  /// and somebody has not confirmed yet.
+  ///
+  /// The banner used to be binary — "the group is still alarming" — driven by a
+  /// twelve second memory of the last alarming beacon heard, refreshed by *any*
+  /// of them including echoes of the very incident the user had just called off.
+  /// So it appeared, aged out, and reappeared on the next straggler, about an
+  /// incident that was finished. Now that announcements are acknowledged, the
+  /// phone knows the actual answer and says it.
+  final bool stopPending;
+
+  /// How many of [stopExpected] phones have confirmed the outstanding stop.
+  final int stopConfirmed;
+
+  /// How many phones this one can currently hear, and is therefore waiting on.
+  final int stopExpected;
   final List<PeerInfo> peers;
   final BoxInfo box;
   final Set<GuardWarning> warnings;
@@ -451,6 +496,9 @@ class GuardSnapshot {
     alarmSubjectId: 0,
     alarmSubjectName: null,
     groupAlarmActive: false,
+    stopPending: false,
+    stopConfirmed: 0,
+    stopExpected: 0,
     peers: <PeerInfo>[],
     box: BoxInfo.empty,
     warnings: <GuardWarning>{},
@@ -458,8 +506,9 @@ class GuardSnapshot {
   );
 
   /// Peers we can currently *see* guarding. A phone whose last beacon said
-  /// "armed" twenty seconds ago is not evidence of anything.
-  int get armedPeerCount => peers.where((p) => p.armed && !p.linkStale).length;
+  /// "armed" a minute ago is not evidence of anything.
+  int get armedPeerCount =>
+      peers.where((p) => p.armed && p.presence != PeerPresence.lost).length;
 
   /// Whether anything in the group is being watched, this phone included.
   ///
@@ -502,6 +551,9 @@ class GuardSnapshot {
       alarmSubjectId: (map['alarmSubjectId'] as num?)?.toInt() ?? 0,
       alarmSubjectName: map['alarmSubjectName'] as String?,
       groupAlarmActive: map['groupAlarmActive'] as bool? ?? false,
+      stopPending: map['stopPending'] as bool? ?? false,
+      stopConfirmed: (map['stopConfirmed'] as num?)?.toInt() ?? 0,
+      stopExpected: (map['stopExpected'] as num?)?.toInt() ?? 0,
       peers: peerList,
       box: BoxInfo.fromMap(map['box'] as Map<Object?, Object?>?),
       warnings: warnings,

@@ -104,10 +104,21 @@ class GuardBridge(private val context: Context, messenger: BinaryMessenger) {
                 result.success(ok)
             }
 
+            // Handed to the service rather than done here, and answered only once
+            // it is finished. Leaving used to be "stop the service, wipe the
+            // store", which told the rest of the group nothing at all: the phone
+            // simply went silent while its last beacon still claimed it was
+            // guarding, which is precisely what a stolen phone looks like. The
+            // store cannot be wiped first either — the farewell is signed with
+            // the group key it is leaving.
             "leaveGroup" -> {
-                GuardService.send(context, GuardIntents.ACTION_STOP)
-                store.leaveGroup()
-                result.success(true)
+                val service = GuardService.instance
+                if (service == null) {
+                    store.leaveGroup()
+                    result.success(true)
+                } else {
+                    service.leaveGroup { result.success(true) }
+                }
             }
 
             "renamePeer" -> {

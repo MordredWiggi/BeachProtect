@@ -18,6 +18,19 @@ object GuardIntents {
     /** Tear the service down completely. */
     const val ACTION_STOP = PREFIX + "STOP"
 
+    /**
+     * Leave the group properly: stand down, say goodbye, wait to be heard, and
+     * only then forget the group and stop.
+     *
+     * Leaving used to be `ACTION_STOP` plus wiping the store, which said nothing
+     * to anybody - the phone simply stopped advertising while its last beacon
+     * still claimed it was guarding. To everyone else that is exactly what a
+     * phone being carried away looks like, so walking out of a group could raise
+     * a `PEER_LOST` siren on the friends left behind, and at best left a card
+     * saying "no signal" for the five minutes of `PEER_FORGET_MS`.
+     */
+    const val ACTION_LEAVE_GROUP = PREFIX + "LEAVE_GROUP"
+
     /** Arm this phone. */
     const val ACTION_ARM = PREFIX + "ARM"
 

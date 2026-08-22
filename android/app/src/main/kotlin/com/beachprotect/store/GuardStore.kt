@@ -345,6 +345,20 @@ class GuardStore(context: Context) : BeaconSource {
         learnedPeerNames = learnedPeerNames + (deviceId to name)
     }
 
+    /**
+     * Drops everything keyed by a device id that has left the group.
+     *
+     * Device ids are a hash of the group secret and the peer's install id, so an
+     * id that has walked away means nothing afterwards - it is only waiting to
+     * be attached to the wrong phone later.
+     */
+    fun forgetPeer(deviceId: Int) {
+        if (peerNames.containsKey(deviceId)) peerNames = peerNames - deviceId
+        if (learnedPeerNames.containsKey(deviceId)) {
+            learnedPeerNames = learnedPeerNames - deviceId
+        }
+    }
+
     // ---- detector tuning -------------------------------------------------
 
     var engineConfig: EngineConfig

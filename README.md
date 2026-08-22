@@ -45,6 +45,10 @@ single cross-check removes the entire class of false alarms.
   group, the phone screaming in the thief's hand makes them drop it.
 - **Disarms with a fingerprint or a shared group PIN**, on a full-screen prompt
   that works over the lock screen.
+- **Stops the whole group's alarm from whichever phone you are holding**, and
+  tells you how many have actually confirmed rather than leaving you guessing.
+- **Says goodbye when you leave a group**, so the friends you leave behind see
+  you go instead of watching you vanish like a stolen phone.
 - **Runs all afternoon** for roughly **2–4 % of the battery over six hours** on
   the default setting — hardware-filtered low-duty scanning, no permanent wake
   lock. See [What it costs the battery](#what-it-costs-the-battery).
@@ -207,8 +211,8 @@ With more phones:
 A guided eight-step field protocol with synchronised log capture from every
 device.
 
-Automated suites — 94 Kotlin tests on the detection engine, the wire protocol
-and the beacon composer, plus 14 Dart tests on snapshot decoding:
+Automated suites — 106 Kotlin tests on the detection engine, the wire protocol
+and the beacon composer, plus 15 Dart tests on snapshot decoding:
 
 ```powershell
 .\tools\test-all.ps1
@@ -224,7 +228,9 @@ and the beacon composer, plus 14 Dart tests on snapshot decoding:
 
 ## Honest limitations
 
-- Every phone must have the app installed and be in the same group.
+- Every phone must have the app installed and be in the same group, **running
+  the same build** — the Bluetooth scan filter matches on the wire version, so a
+  phone on an older version is invisible rather than merely degraded.
 - The app has to stay open. Backgrounded is fine; swiped out of Recents stops
   the guard, and it does not come back by itself after a reboot.
 - Distance is approximate; the UI shows coarse buckets rather than fake metres.

@@ -37,6 +37,9 @@ object Codec {
         "alarmSubjectId" to snapshot.alarmSubjectId,
         "alarmSubjectName" to nameFor(snapshot, localNames, learnedNames, snapshot.alarmSubjectId),
         "groupAlarmActive" to snapshot.groupAlarmActive,
+        "stopPending" to snapshot.stopPending,
+        "stopConfirmed" to snapshot.stopConfirmed,
+        "stopExpected" to snapshot.stopExpected,
         "peers" to snapshot.peers.map { peer(it, localNames, learnedNames) },
         "box" to mapOf(
             "configured" to snapshot.box.configured,
@@ -74,7 +77,7 @@ object Codec {
         "boxGuardian" to peer.boxGuardian,
         "simulated" to peer.simulated,
         "lastSeenMsAgo" to peer.lastSeenMsAgo,
-        "linkStale" to peer.linkStale,
+        "presence" to peer.presence.name,
         "staleAfterMs" to peer.staleAfterMs,
         "suspected" to peer.suspected,
         "votesAgainst" to peer.votesAgainst,

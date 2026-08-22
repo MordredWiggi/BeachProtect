@@ -124,6 +124,18 @@ class GuardService : Service(),
      */
     private var stopWhenIdle = false
 
+    /**
+     * Set while this phone's farewell is going out.
+     *
+     * Leaving is a sequence, not a switch: stand down, say goodbye, wait until
+     * the others have confirmed hearing it, and only then forget the group. The
+     * store must not be wiped before the last step, because the farewell has to
+     * be signed with the group key it is leaving.
+     */
+    private var leaving = false
+    private var leavingSince = 0L
+    private var onLeft: (() -> Unit)? = null
+
     // =====================================================================
     // Lifecycle
     // =====================================================================
@@ -134,9 +146,7 @@ class GuardService : Service(),
         adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
 
         engineDeviceId = store.deviceId
-        engine = ThreatEngine(engineDeviceId, this, store.engineConfig).also {
-            it.selfName = store.selfName
-        }
+        engine = newEngine()
         composer = BeaconComposer(store)
         advertiser = BleAdvertiser(adapter)
         scanner = BleScanner(adapter, this)
@@ -171,6 +181,12 @@ class GuardService : Service(),
             GuardIntents.ACTION_START, null -> ensureStarted()
             GuardIntents.ACTION_STOP -> {
                 shutdown()
+                return START_NOT_STICKY
+            }
+
+            GuardIntents.ACTION_LEAVE_GROUP -> {
+                ensureStarted()
+                leaveGroup {}
                 return START_NOT_STICKY
             }
 
@@ -292,16 +308,92 @@ class GuardService : Service(),
      * from everybody else. Without recording it as already seen, the issuer would
      * treat each echo as a fresh command and start relaying it again.
      */
-    private fun announceGroupCommand(eventType: Int) {
+    private fun announceGroupCommand(eventType: Int, durationMs: Long = BeaconComposer.CONTROL_REPEAT_MS) {
         val now = now()
         // One counter per press, persisted and monotonic. It is what makes this
         // decision distinguishable from the last one of the same kind - see
-        // ThreatEngine.commandCounters for why that is not optional.
+        // ThreatEngine.commandCounters for why that is not optional - and it is
+        // what the rest of the group acknowledges, which is what lets the
+        // announcement stop rather than running its whole window out.
         val counter = store.nextCommandCounter()
-        engine.noteOwnGroupCommand(counter)
-        composer.queueControl(now, eventType, store.deviceId, counter)
+        engine.noteOwnGroupCommand(eventType, counter, now)
+        composer.queueControl(now, eventType, store.deviceId, counter, durationMs)
         advertiser.updatePayload(composeBeacon())
         restartRadios()
+    }
+
+    /**
+     * Takes this phone's own announcement off the air once everybody has
+     * confirmed it.
+     *
+     * Only ever our own: a relay of somebody else's decision runs its own short
+     * window out, because the phones it is meant for are by definition ones we
+     * cannot hear and therefore cannot collect confirmations from.
+     */
+    private fun retireFinishedAnnouncement(now: Long) {
+        if (!composer.controlPending(now)) return
+        if (composer.pendingControlSubject != store.deviceId) return
+        if (engine.announcementNeedsAir(now)) return
+        Log.i(TAG, "announcement confirmed by everyone in earshot; off the air")
+        composer.clearControl()
+    }
+
+    /**
+     * Leaves the group, and calls [onDone] once it has actually been forgotten.
+     *
+     * The order matters at every step. The guard stands down *first*, so the last
+     * beacon anybody catches from this phone is not one claiming to be guarding
+     * something. The farewell then goes out at the raised advertising rate and is
+     * relayed by everyone who hears it, exactly like any other group command, and
+     * this phone waits to be acknowledged before it forgets the group — because
+     * the group key is what signs the farewell, and a phone that wiped its secret
+     * first would have nothing left to say goodbye with.
+     *
+     * The wait is bounded by [LEAVE_ANNOUNCE_MS]. Somebody who is out of range
+     * simply does not hear it, and falls back to noticing the silence — which is
+     * the honest outcome, and the reason the leave screen shows what it is doing
+     * rather than pretending to be instant.
+     */
+    fun leaveGroup(onDone: () -> Unit) {
+        if (leaving) {
+            val previous = onLeft
+            onLeft = { previous?.invoke(); onDone() }
+            return
+        }
+        if (!store.hasGroup || !started) {
+            store.leaveGroup()
+            shutdown()
+            onDone()
+            return
+        }
+        leaving = true
+        leavingSince = now()
+        onLeft = onDone
+        engine.disarm(now())
+        store.armed = false
+        announceGroupCommand(Protocol.EVENT_LEAVE, LEAVE_ANNOUNCE_MS)
+        scheduleTick(immediate = true)
+        // Belt and braces. The tick loop is what normally finishes this, but a
+        // guard that has stopped ticking must not leave somebody staring at a
+        // spinner over a group they have already decided to leave.
+        handler.postDelayed({ finishLeaving() }, LEAVE_ANNOUNCE_MS + LEAVE_GRACE_MS)
+    }
+
+    private fun finishLeavingIfDone(now: Long) {
+        val expired = now - leavingSince >= LEAVE_ANNOUNCE_MS
+        if (!expired && engine.announcementNeedsAir(now)) return
+        finishLeaving()
+    }
+
+    private fun finishLeaving() {
+        if (!leaving) return
+        leaving = false
+        val done = onLeft
+        onLeft = null
+        Log.i(TAG, "farewell delivered; leaving the group")
+        store.leaveGroup()
+        shutdown()
+        done?.invoke()
     }
 
     /**
@@ -362,17 +454,34 @@ class GuardService : Service(),
     private fun ensureStarted() {
         if (started) return
         started = true
+        // Restore the armed state *before* the radios come up. A fresh engine is
+        // DISARMED, so starting the advertiser first put a beacon on the air
+        // saying this phone was not guarding - and at the calm one-per-second
+        // interval that is a real packet, caught by real phones, which duly
+        // showed "not guarding" for a second every time the service was
+        // restarted. Ordering is the whole fix.
+        if (store.armed && engine.state == GuardState.DISARMED) {
+            engine.arm(now())
+        }
         applyConfig()
         motion.start()
         motion.setGuardActive(engine.state != GuardState.DISARMED)
         restartRadios()
-        // Restore the armed state after a reboot or a process kill.
-        if (store.armed && engine.state == GuardState.DISARMED) {
-            engine.arm(now())
-        }
     }
 
     private fun shutdown() {
+        // A departure in progress has somebody waiting on an answer, and this is
+        // the only place left that can give them one. Finish it rather than
+        // leaving the leave screen spinning over a group it has already decided
+        // to leave. (The normal route clears these before it gets here, so this
+        // only fires when something else took the service down mid-farewell.)
+        val interruptedLeave = onLeft
+        if (leaving) {
+            leaving = false
+            onLeft = null
+            store.leaveGroup()
+        }
+
         started = false
         stopWhenIdle = false
         handler.removeCallbacksAndMessages(null)
@@ -407,6 +516,7 @@ class GuardService : Service(),
             notificationManager().cancel(NOTIFICATION_ID_ALARM)
         }
         stopSelf()
+        interruptedLeave?.invoke()
     }
 
     // =====================================================================
@@ -435,13 +545,24 @@ class GuardService : Service(),
         restartRadios()
     }
 
+    /**
+     * A guard for the current identity.
+     *
+     * The counter supplier is the persisted, monotonic one: incidents and group
+     * commands are both announcements from this device and both have to keep
+     * climbing across restarts, or a phone that came back at zero would have its
+     * next hundred-odd announcements read as stale by everybody who still
+     * remembered the old number.
+     */
+    private fun newEngine(): ThreatEngine =
+        ThreatEngine(engineDeviceId, this, store.engineConfig) { store.nextCommandCounter() }
+            .also { it.selfName = store.selfName }
+
     /** Builds a fresh engine for the current identity, preserving armed state. */
     private fun rebuildEngine() {
         val wasArmed = ::engine.isInitialized && engine.state != GuardState.DISARMED
         engineDeviceId = store.deviceId
-        engine = ThreatEngine(engineDeviceId, this, store.engineConfig).also {
-            it.selfName = store.selfName
-        }
+        engine = newEngine()
         simulator = Simulator(engine, this)
         engine.configureBox(
             configured = store.boxEnabled && store.boxAddress != null,
@@ -567,9 +688,11 @@ class GuardService : Service(),
         }
         simulator.tick(now)
         engine.tick(now)
+        retireFinishedAnnouncement(now)
         advertiser.updatePayload(composeBeacon())
         publishSnapshot()
         updateNotification(now)
+        if (leaving) finishLeavingIfDone(now)
     }
 
     private fun composeBeacon(): ByteArray {
@@ -581,8 +704,15 @@ class GuardService : Service(),
         // Only the phone that decided on the incident repeats it. A phone that
         // is merely joining in stays quiet on the wire, so there is exactly one
         // thing to silence; see ThreatEngine.alarmOriginatedHere.
+        //
+        // And it stops repeating as soon as every phone in earshot has confirmed
+        // hearing it. The siren is untouched by that - this is only about the
+        // event slot. What it removes is the stream of packets that used to keep
+        // describing an incident for as long as it ran, and go on arriving for
+        // seconds after it ended, which is what made "the group is still
+        // alarming" impossible to answer honestly.
         val alarming = engine.state == GuardState.ALARM &&
-            engine.alarmOriginatedHere && !rehearsing
+            engine.alarmOriginatedHere && !rehearsing && engine.alarmNeedsAir(now())
         val alarmEvent = engine.selfAlarmEvent()
         var flags = engine.selfFlags()
         // Likewise for the flag: a rehearsing phone must not show up as
@@ -602,7 +732,9 @@ class GuardService : Service(),
                 alarming = alarming,
                 alarmEvent = alarmEvent,
                 alarmSubject = engine.alarmSubject,
+                alarmCounter = engine.alarmCounter,
                 votes = engine.activeVotes(now()),
+                acks = engine.acksToSend(now()),
                 allowName = engine.canBroadcastName(now()),
                 name = store.selfName,
             ),
@@ -773,6 +905,15 @@ class GuardService : Service(),
 
     override fun onPeerNameLearned(deviceId: Int, name: String) {
         store.rememberLearnedName(deviceId, name)
+    }
+
+    override fun onPeerLeft(deviceId: Int) {
+        Log.i(TAG, "peer ${deviceId.toString(16)} left the group")
+        // Names go with it. Device ids are derived from the group secret, so a
+        // departed id means nothing afterwards - it is only waiting to be
+        // attached to the wrong phone later.
+        store.forgetPeer(deviceId)
+        scheduleTick(immediate = true)
     }
 
     override fun onRadioProfileChanged(profile: RadioProfile) {
@@ -1275,6 +1416,19 @@ class GuardService : Service(),
 
         /** How long a rehearsal alarm stays up before standing itself down. */
         private const val REHEARSAL_CLEAR_MS = 1_400L
+
+        /**
+         * The longest this phone waits to be acknowledged before leaving anyway.
+         *
+         * Normally it finishes well inside this: the farewell goes out at the
+         * raised advertising rate, everybody in earshot relays and confirms it,
+         * and the whole thing is over in a second or two. This is the ceiling for
+         * the case where somebody is out of range and never answers.
+         */
+        private const val LEAVE_ANNOUNCE_MS = 3_500L
+
+        /** Slack on the fallback timer, so it never races the tick that finishes. */
+        private const val LEAVE_GRACE_MS = 500L
 
         /** Time to lock the phone before the lock-screen test fires. */
         private const val LOCKSCREEN_TEST_DELAY_MS = 6_000L

@@ -25,6 +25,9 @@ class Recorder : EngineListener {
 
     /** Peer names fully reassembled from beacons: device id to name. */
     val learnedNames = mutableListOf<Pair<Int, String>>()
+
+    /** Peers that announced they were leaving the group. */
+    val departed = mutableListOf<Int>()
     var clearedCount = 0
     var profile = RadioProfile.CALM
     var warnings: Set<GuardWarning> = emptySet()
@@ -61,6 +64,10 @@ class Recorder : EngineListener {
 
     override fun onPeerNameLearned(deviceId: Int, name: String) {
         learnedNames += deviceId to name
+    }
+
+    override fun onPeerLeft(deviceId: Int) {
+        departed += deviceId
     }
 
     override fun onRadioProfileChanged(profile: RadioProfile) {
@@ -180,6 +187,45 @@ fun command(
     armed = armed,
     seq = seq,
     eventType = eventType,
+    subjectId = origin,
+    motionScore = counter,
+)
+
+/**
+ * An alarm as it actually appears on the wire.
+ *
+ * The counter is what turns "an alarm" into *this* alarm: exactly one phone
+ * announces an incident, so its device id and this counter name the incident
+ * between them - which is what everybody else acknowledges, and what tells an
+ * echo of something already stood down from a fresh theft.
+ */
+fun alarm(
+    from: Int,
+    subject: Int,
+    counter: Int = 1,
+    seq: Int = 1,
+    eventType: Int = Protocol.EVENT_ALARM,
+): Beacon = beacon(
+    from,
+    alarming = true,
+    seq = seq,
+    eventType = eventType,
+    subjectId = subject,
+    motionScore = counter,
+)
+
+/** A confirmation: subject carries who announced it, the motion byte which one. */
+fun ack(
+    from: Int,
+    origin: Int,
+    counter: Int = 1,
+    seq: Int = 1,
+    alarming: Boolean = false,
+): Beacon = beacon(
+    from,
+    alarming = alarming,
+    seq = seq,
+    eventType = Protocol.EVENT_ACK,
     subjectId = origin,
     motionScore = counter,
 )

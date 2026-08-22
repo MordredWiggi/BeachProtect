@@ -129,8 +129,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             // Shown for as long as *the group* is in an incident, not just this
             // phone. Silencing your own handset used to take these controls away
             // while everybody else carried on screaming.
+            //
+            // ...and for as long as a stop this phone issued is still going out,
+            // which is the honest end of an incident: the panel now reports what
+            // it is actually doing and how far it has got, instead of vanishing
+            // and reappearing as stale packets drifted in.
             if (snapshot.state == GuardState.alarm ||
-                snapshot.groupAlarmActive) ...[
+                snapshot.groupAlarmActive ||
+                snapshot.stopPending) ...[
               _AlarmPanel(controller: controller, snapshot: snapshot),
               const SizedBox(height: 18),
             ],
@@ -511,10 +517,16 @@ class _AlarmPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final status = context.status;
+    final here = snapshot.state == GuardState.alarm;
     // This phone is out of it, but somebody else is not. That combination used
     // to be a dead end: no alarm panel, and a quick action offering to "Arm
     // all" while the towel was still screaming.
-    final onlyOthers = snapshot.state != GuardState.alarm;
+    final onlyOthers = !here && snapshot.groupAlarmActive;
+    // A stop this phone issued is still going out. Giving that its own voice is
+    // what replaced the banner that appeared and disappeared at random: the
+    // phone now knows exactly who has confirmed, so it says so instead of
+    // guessing from whichever packet it last happened to catch.
+    final stopping = snapshot.stopPending;
     return Container(
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
@@ -526,9 +538,11 @@ class _AlarmPanel extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            onlyOthers
-                ? 'The group is still alarming'
-                : snapshot.alarmReason?.label ?? 'Theft alarm',
+            switch ((here, onlyOthers)) {
+              (true, _) => snapshot.alarmReason?.label ?? 'Theft alarm',
+              (_, true) => 'The group is still alarming',
+              _ => 'Stopping everyone',
+            },
             style: TextStyle(
               fontSize: 17,
               fontWeight: FontWeight.w800,
@@ -546,7 +560,7 @@ class _AlarmPanel extends StatelessWidget {
                 color: context.colors.onSurface.withValues(alpha: 0.75),
               ),
             )
-          else if (snapshot.alarmSubjectName != null)
+          else if (here && snapshot.alarmSubjectName != null)
             Text(
               snapshot.alarmSubjectName!,
               style: TextStyle(
@@ -554,8 +568,42 @@ class _AlarmPanel extends StatelessWidget {
                 color: context.colors.onSurface.withValues(alpha: 0.75),
               ),
             ),
-          if (snapshot.state == GuardState.alarm &&
-              !snapshot.diagnostics.sirenAudible) ...[
+          // The count is the point. "Waiting for 1 phone" is a fact the phone
+          // can now establish, and it either resolves in a second or two or
+          // tells you honestly that somebody is out of reach - which is a far
+          // more useful thing to look at than a banner blinking on and off.
+          if (stopping) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                SizedBox(
+                  width: 15,
+                  height: 15,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: status.alarm,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    snapshot.stopExpected == 0
+                        ? 'Telling the group to stop...'
+                        : '${snapshot.stopConfirmed} of '
+                            '${snapshot.stopExpected} '
+                            '${snapshot.stopExpected == 1 ? 'phone has' : 'phones have'}'
+                            ' confirmed',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: context.colors.onSurface.withValues(alpha: 0.75),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          if (here && !snapshot.diagnostics.sirenAudible) ...[
             const SizedBox(height: 10),
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,

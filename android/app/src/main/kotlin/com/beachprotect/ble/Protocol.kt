@@ -30,16 +30,43 @@ import javax.crypto.spec.SecretKeySpec
  *     10      2   seq              monotonic, persisted; replay protection
  *     12      1   eventType        see EVENT_*
  *     13      2   subjectId        device this event refers to
- *     15      1   motionScore      0..255 recent motion energy of the sender
+ *     15      1   motionScore      0..255 recent motion energy of the sender,
+ *                                  or a counter — see [carriesCounter]
  *     16      4   mac              HMAC-SHA256(groupKey, bytes[0..15])[0..3]
  *
  * The MAC means an outsider cannot inject a fake "disarm everyone" or a fake
  * alarm, and the monotonic [Beacon.seq] means a recorded packet cannot be
  * replayed later. Both are checked before a beacon influences any decision.
+ *
+ * ## Everything announced is *identified*, and everything identified is acked
+ *
+ * Alarms, group commands and departures all borrow the motion-score byte for a
+ * counter, so each one is a nameable thing — `(origin device, counter)` — rather
+ * than merely a type. That single idea does three separate jobs:
+ *
+ *  - a stale copy still circulating half a minute later is recognisably *the
+ *    same* announcement and is dropped rather than re-applied;
+ *  - a genuine second press is recognisably *different* and is obeyed;
+ *  - and, because it can be named, it can be **acknowledged** ([EVENT_ACK]).
+ *
+ * The third is what lets an announcement stop. Without it the only safe policy
+ * was to repeat everything blindly for tens of seconds and hope, which left the
+ * air full of packets describing incidents that were already over — and a phone
+ * that had stopped could not tell those apart from a phone that had not.
  */
 object Protocol {
 
-    const val VERSION = 1
+    /**
+     * Wire version. Bumped to 2 when alarms gained incident counters and the
+     * acknowledgement and departure events were added.
+     *
+     * Deliberately a hard break: the scan filter matches on this byte, so a v1
+     * phone and a v2 phone simply do not see each other. A v1 phone would
+     * otherwise read an alarm's incident counter as a motion score and ignore
+     * departures entirely, and a mesh that half works is worse than one that
+     * visibly does not.
+     */
+    const val VERSION = 2
     const val PAYLOAD_SIZE = 20
     private const val SIGNED_PREFIX = 16
 
@@ -65,15 +92,23 @@ object Protocol {
     /** Observer vote: "[Beacon.subjectId] vanished from the mesh while armed." */
     const val EVENT_LOST = 2
 
-    /** Decision: "[Beacon.subjectId] is being stolen - everybody sound off." */
+    /**
+     * Decision: "[Beacon.subjectId] is being stolen - everybody sound off."
+     *
+     * One of the three **alarm events**. For these, bytes 13..15 read
+     * `subjectId` (the device being taken) and, in place of the motion score, an
+     * incident counter. Exactly one phone puts an alarm on the air — the one
+     * that decided on it — so `(deviceId, counter)` names the incident with no
+     * extra bytes, and that name is what everyone else acknowledges.
+     */
     const val EVENT_ALARM = 3
 
     /**
      * Stop all sirens but stay armed (recalibrates baselines).
      *
-     * One of the three **group commands**. For these, bytes 13..15 read
-     * `originId` (the device that decided it, unchanged through every relay) and
-     * a [Beacon.commandCounter] in place of the motion score.
+     * One of the **group commands**. For these, bytes 13..15 read `originId`
+     * (the device that decided it, unchanged through every relay) and a
+     * [Beacon.counter] in place of the motion score.
      */
     const val EVENT_ALARM_CLEAR = 4
 
@@ -108,14 +143,63 @@ object Protocol {
      */
     const val EVENT_NAME = 10
 
+    /**
+     * "I have received the announcement `(subjectId, counter)`."
+     *
+     * The one addition that lets anything ever stop being repeated. Before it,
+     * an alarm stayed in the event slot for as long as the siren ran and a group
+     * command was repeated blindly for twenty-five seconds, because there was no
+     * way to find out whether it had landed. Every phone in range was therefore
+     * still hearing an incident several seconds after the last person had
+     * silenced it, and a phone that had stopped had no way to tell that echo
+     * apart from a phone that genuinely had not stopped — which is exactly what
+     * "the group is still alarming" kept popping up about.
+     *
+     * An announcer now stops as soon as every phone it can hear has confirmed,
+     * typically inside two seconds, and starts again by itself if a phone it has
+     * not heard from appears. `subjectId` carries the announcement's origin and
+     * the motion-score byte its counter, so one event acknowledges incidents,
+     * commands and departures alike.
+     */
+    const val EVENT_ACK = 11
+
+    /**
+     * "I am leaving this group." A group command, relayed and acknowledged.
+     *
+     * Departure used to be silent: the phone simply stopped advertising, which
+     * to everyone else is indistinguishable from a phone that has been switched
+     * off, bagged, or carried away while armed — so leaving a group could raise
+     * a `PEER_LOST` siren on the friends left behind, and at best left a card
+     * reading "no signal" for the five minutes of `PEER_FORGET_MS`.
+     */
+    const val EVENT_LEAVE = 12
+
     const val NAME_CHUNKS = 6
     const val NAME_MAX_LENGTH = NAME_CHUNKS * 2
 
-    /** The three events that carry a group decision rather than telemetry. */
+    /** The events that carry a group decision rather than telemetry. */
     fun isGroupCommand(eventType: Int): Boolean = when (eventType) {
-        EVENT_ALARM_CLEAR, EVENT_DISARM_ALL, EVENT_ARM_ALL -> true
+        EVENT_ALARM_CLEAR, EVENT_DISARM_ALL, EVENT_ARM_ALL, EVENT_LEAVE -> true
         else -> false
     }
+
+    /** The events that say "somebody is being robbed", in their three flavours. */
+    fun isAlarmEvent(eventType: Int): Boolean = when (eventType) {
+        EVENT_ALARM, EVENT_BOX_ALARM, EVENT_PANIC -> true
+        else -> false
+    }
+
+    /**
+     * Whether this event borrows the motion-score byte for a counter.
+     *
+     * Safe for the same reason it has always been safe for name chunks: the
+     * occlusion gate keys on `FLAG_STATIONARY`, which still travels untouched in
+     * the flags byte, and a receiver simply keeps the motion score it already
+     * had. What it buys is that every announcement has an identity, and can
+     * therefore be recognised, superseded and acknowledged.
+     */
+    fun carriesCounter(eventType: Int): Boolean =
+        isGroupCommand(eventType) || isAlarmEvent(eventType) || eventType == EVENT_ACK
 
     /**
      * Is [candidate] a later command from the same device than [last]?
@@ -383,21 +467,20 @@ data class Beacon(
     /** True when this packet's bytes 13..15 are name characters, not telemetry. */
     val carriesName: Boolean get() = eventType == Protocol.EVENT_NAME
 
-    /** True when [motionScore] holds a command counter rather than telemetry. */
-    val carriesCommand: Boolean get() = Protocol.isGroupCommand(eventType)
+    /** True when [motionScore] holds a counter rather than telemetry. */
+    val carriesCounter: Boolean get() = Protocol.carriesCounter(eventType)
 
     /** True when [motionScore] means what it says. */
-    val carriesTelemetry: Boolean get() = !carriesName && !carriesCommand
+    val carriesTelemetry: Boolean get() = !carriesName && !carriesCounter
 
     /**
-     * Which press of its owner's button this is. Only meaningful when
-     * [carriesCommand].
+     * Which announcement this is: the counter half of `(origin, counter)`.
      *
      * There is no room for a field of its own in twenty bytes, so the motion
-     * score is borrowed for the three group-command events — exactly as it is
-     * for name chunks, and safe for the same reason: `FLAG_STATIONARY`, which is
-     * what the occlusion gate actually keys on, still travels untouched in the
-     * flags byte, and the receiver keeps the motion score it already had.
+     * score is borrowed — exactly as it is for name chunks, and safe for the
+     * same reason: `FLAG_STATIONARY`, which is what the occlusion gate actually
+     * keys on, still travels untouched in the flags byte, and the receiver keeps
+     * the motion score it already had. Only meaningful when [carriesCounter].
      */
-    val commandCounter: Int get() = motionScore
+    val counter: Int get() = motionScore
 }

@@ -7,6 +7,7 @@ import com.beachprotect.guard.EngineConfig
 import com.beachprotect.guard.GuardState
 import com.beachprotect.guard.GuardWarning
 import com.beachprotect.guard.MotionSignal
+import com.beachprotect.guard.PeerPresence
 import com.beachprotect.guard.RadioProfile
 import com.beachprotect.guard.ThreatEngine
 import org.junit.Assert.assertEquals
@@ -980,7 +981,7 @@ class ThreatEngineTest {
         h.armAndCalibrate()
 
         // This phone told everybody to stand down, and stood itself down...
-        h.engine.noteOwnGroupCommand(6)
+        h.engine.noteOwnGroupCommand(Protocol.EVENT_DISARM_ALL, 6, h.now)
         h.engine.disarm(h.now, groupWide = true)
         // ...and then thought better of it.
         h.engine.arm(h.now)
@@ -1210,10 +1211,51 @@ class ThreatEngineTest {
     fun `a peer that has gone quiet is reported as unheard rather than as stale news`() {
         val h = Harness()
         h.armAndCalibrate()
-        assertFalse(h.engine.snapshot(h.now).peers.single().linkStale)
+        assertEquals(
+            PeerPresence.PRESENT, h.engine.snapshot(h.now).peers.single().presence,
+        )
 
-        h.advance(40_000, stepMs = 1_000)
-        assertTrue(h.engine.snapshot(h.now).peers.single().linkStale)
+        h.advance(60_000, stepMs = 1_000)
+        assertEquals(
+            PeerPresence.LOST, h.engine.snapshot(h.now).peers.single().presence,
+        )
+    }
+
+    /**
+     * Regression test, and the one that pins down why the group list flickered.
+     *
+     * A duty-cycled scanner drops packets in *runs*, not independently: a phone
+     * behind a body, or a radio having a bad minute, produces several long gaps
+     * one after another. With a single threshold evaluated fresh every tick,
+     * every one of those runs repainted the card — green "still, watched" to grey
+     * and straight back on the next packet — which from the outside is a group
+     * list changing at random between two states the phone was never actually in.
+     *
+     * What the user is shown must therefore change on a *blunter* rule than the
+     * one the detector votes on. A gap long enough to notice moves the peer to
+     * MISSING, which is worth listening harder about and worth annotating the
+     * card with, but changes nothing about what it says.
+     */
+    @Test
+    fun `a run of missed scan windows never repaints a peer`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        val states = mutableListOf<PeerPresence>()
+        // Four separate silences of thirteen seconds - comfortably past the ten
+        // second threshold - each ended by a single beacon getting through.
+        repeat(4) {
+            h.advance(13_000, stepMs = 1_000) {
+                states += h.engine.snapshot(h.now).peers.single().presence
+            }
+            h.engine.onPeerBeacon(h.now, -60, beacon(PEER_A))
+            states += h.engine.snapshot(h.now).peers.single().presence
+        }
+
+        assertFalse(
+            "silence a duty cycle explains must never reach the state that repaints the card",
+            states.contains(PeerPresence.LOST),
+        )
     }
 
     // =====================================================================
@@ -1370,11 +1412,15 @@ class ThreatEngineTest {
         assertEquals(RadioProfile.ALERT, h.recorder.profile)
 
         sendName(h, PEER_A, "Lisa", armed = false)
-        h.advance(1_000)
+        // Past the dwell: coming back down is deliberately not instant, because
+        // a profile that flaps takes the advertiser off the air on every change
+        // and spends the scan-start allowance Android rations. Escalating still
+        // is instant - that is the half that has to be.
+        h.advance(ThreatEngine.RADIO_DWELL_MS + 1_000)
 
         assertEquals("Lisa", h.engine.snapshot(h.now).peers.single().name)
         assertEquals(
-            "and drops straight back once we know who they are",
+            "and drops back once we know who they are",
             RadioProfile.CALM, h.recorder.profile,
         )
     }
@@ -1540,5 +1586,260 @@ class ThreatEngineTest {
             h.engine.onPeerBeacon(t, -60, beacon(PEER_A, stationary = true))
         }
         assertEquals(com.beachprotect.guard.RadioProfile.CALM, h.recorder.profile)
+    }
+
+    // =====================================================================
+    // Announcements that finish - the acknowledgement protocol
+    // =====================================================================
+
+    /**
+     * The core of it: an announcer stops when it has been heard.
+     *
+     * Everything used to be repeated blindly and for a long time, because
+     * nothing could tell the sender whether it had landed. An alarm stayed in
+     * the event slot for as long as the siren ran and a group command for
+     * twenty-five seconds flat, so at any moment the air was full of packets
+     * describing decisions that had already been acted on everywhere - and a
+     * phone receiving one had no way to tell it apart from news.
+     */
+    @Test
+    fun `an incident leaves the air once everybody has confirmed it`() {
+        val h = Harness()
+        h.armAndSettle(listOf(PEER_A, PEER_B))
+        h.engine.panic(h.now)
+
+        val counter = h.engine.alarmCounter
+        assertTrue("somebody has to hear it first", h.engine.alarmNeedsAir(h.now))
+
+        h.advance(ThreatEngine.ANNOUNCE_MIN_MS + 500, stepMs = 250) { t ->
+            listOf(PEER_A, PEER_B).forEach { h.engine.onPeerBeacon(t, -60, beacon(it)) }
+        }
+        assertTrue("nobody has confirmed yet", h.engine.alarmNeedsAir(h.now))
+
+        h.engine.onPeerBeacon(h.now, -60, ack(PEER_A, origin = SELF_ID, counter = counter, seq = 40))
+        assertTrue("one of two is not everybody", h.engine.alarmNeedsAir(h.now))
+
+        h.engine.onPeerBeacon(h.now, -60, ack(PEER_B, origin = SELF_ID, counter = counter, seq = 41))
+        assertFalse(
+            "heard by everyone in earshot, so there is nothing left to say",
+            h.engine.alarmNeedsAir(h.now),
+        )
+        assertEquals(
+            "and the siren is untouched by any of it",
+            GuardState.ALARM, h.engine.state,
+        )
+    }
+
+    /**
+     * ...and it is safe to stop, because stopping is not a decision, it is a
+     * continuously re-evaluated fact.
+     */
+    @Test
+    fun `an incident goes back on the air for a phone that turns up late`() {
+        val h = Harness()
+        h.armAndSettle(listOf(PEER_A))
+        h.engine.panic(h.now)
+        val counter = h.engine.alarmCounter
+
+        h.advance(ThreatEngine.ANNOUNCE_MIN_MS + 500, stepMs = 250) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A))
+        }
+        h.engine.onPeerBeacon(h.now, -60, ack(PEER_A, origin = SELF_ID, counter = counter, seq = 40))
+        assertFalse(h.engine.alarmNeedsAir(h.now))
+
+        // Somebody's phone comes out of a bag, having missed the whole thing.
+        h.engine.onPeerBeacon(h.now, -60, beacon(PEER_C, seq = 1))
+        assertTrue(
+            "a phone that has not confirmed is a phone that has not heard",
+            h.engine.alarmNeedsAir(h.now),
+        )
+    }
+
+    @Test
+    fun `a group command stops being repeated once everyone confirms`() {
+        val h = Harness()
+        h.armAndSettle(listOf(PEER_A))
+
+        h.engine.noteOwnGroupCommand(Protocol.EVENT_ALARM_CLEAR, counter = 9, now = h.now)
+        h.advance(ThreatEngine.ANNOUNCE_MIN_MS + 500, stepMs = 250) { t ->
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A))
+        }
+        assertTrue(h.engine.announcementNeedsAir(h.now))
+        assertEquals(0 to 1, h.engine.announcementProgress())
+
+        h.engine.onPeerBeacon(h.now, -60, ack(PEER_A, origin = SELF_ID, counter = 9, seq = 40))
+        assertEquals(1 to 1, h.engine.announcementProgress())
+        assertFalse(h.engine.announcementNeedsAir(h.now))
+    }
+
+    /**
+     * Regression test for the message that kept popping up after everything had
+     * already been silenced.
+     *
+     * A stop cannot land on every phone in the same millisecond, so for seconds
+     * afterwards the air still carries beacons from the incident that was just
+     * called off. The banner used to be driven by "did any alarming beacon
+     * arrive recently", refreshed by every one of those - so it appeared, aged
+     * out after twelve seconds, and came back on the next straggler, about an
+     * incident nobody was in any more.
+     */
+    @Test
+    fun `echoes of a stopped incident never claim the group is still alarming`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        // PEER_A decides on an incident and this phone joins in.
+        var seq = 20
+        h.engine.onPeerBeacon(h.now, -60, alarm(PEER_A, subject = PEER_B, counter = 5, seq = ++seq))
+        assertEquals(GuardState.ALARM, h.engine.state)
+
+        // The user stops everyone from here.
+        h.engine.stopGroupAlarm(h.now)
+        assertFalse(h.engine.groupAlarmActive())
+
+        // Nobody has caught up yet, so for a few seconds the air still carries
+        // the incident: PEER_A still announcing it, and a phone that had merely
+        // joined in - which says which incident it is in only through the
+        // confirmation it broadcasts.
+        h.advance(8_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(t, -60, alarm(PEER_A, subject = PEER_B, counter = 5, seq = ++seq))
+            h.engine.onPeerBeacon(
+                t, -60,
+                ack(PEER_C, origin = PEER_A, counter = 5, seq = ++seq, alarming = true),
+            )
+            assertFalse(
+                "an incident the group has called off is over, echoes included",
+                h.engine.groupAlarmActive(),
+            )
+        }
+        assertNotEquals(
+            "and none of it can restart the siren either",
+            GuardState.ALARM, h.engine.state,
+        )
+    }
+
+    /**
+     * The limit of the above, and it is a feature rather than a leak.
+     *
+     * A phone that is genuinely out of range never hears "stop" and never stops.
+     * The user has to find that out - so the call-off is deliberately allowed to
+     * expire rather than being refreshed by every echo it silences. What that
+     * buys is that the banner comes back *once*, after the attempt to reach the
+     * phone has run its course, instead of flickering on and off throughout it.
+     */
+    @Test
+    fun `a phone that never hears the stop is eventually reported again`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        var seq = 20
+        h.engine.onPeerBeacon(h.now, -60, alarm(PEER_A, subject = PEER_B, counter = 5, seq = ++seq))
+        h.engine.stopGroupAlarm(h.now)
+
+        h.advance(ThreatEngine.DECLINED_FORGET_MS + 4_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(t, -60, alarm(PEER_A, subject = PEER_B, counter = 5, seq = ++seq))
+        }
+
+        assertTrue(
+            "somebody really is still screaming, and that has to be reachable",
+            h.engine.groupAlarmActive(),
+        )
+        assertEquals(
+            "...without this phone being dragged back into it",
+            GuardState.ARMED, h.engine.state,
+        )
+    }
+
+    /**
+     * The other half, which must survive the fix: silencing *your own* handset
+     * says nothing about anybody else's. Losing that is how somebody ended up
+     * with a screaming towel and an "Arm all" button.
+     */
+    @Test
+    fun `a local disarm does not pretend the group has stopped`() {
+        val h = Harness()
+        h.armAndCalibrate()
+
+        var seq = 20
+        h.engine.onPeerBeacon(h.now, -60, alarm(PEER_A, subject = PEER_B, counter = 5, seq = ++seq))
+        h.engine.disarm(h.now)
+
+        h.advance(6_000, stepMs = 500) { t ->
+            h.engine.onPeerBeacon(t, -60, alarm(PEER_A, subject = PEER_B, counter = 5, seq = ++seq))
+        }
+        assertTrue(
+            "the controls that reach the others have to stay reachable",
+            h.engine.groupAlarmActive(),
+        )
+    }
+
+    // =====================================================================
+    // Leaving a group
+    // =====================================================================
+
+    /**
+     * Leaving used to be silent - the phone simply stopped advertising - and to
+     * everybody else that is indistinguishable from a phone being carried away
+     * while armed. In a two-phone group one LOST vote is the whole consensus, so
+     * walking out of a group could set off a siren on the friend left behind.
+     */
+    @Test
+    fun `a phone that says goodbye is dropped rather than mourned`() {
+        val h = Harness()
+        h.armAndSettle(listOf(PEER_A))
+        assertEquals(1, h.engine.snapshot(h.now).peers.size)
+
+        h.engine.onPeerBeacon(
+            h.now, -60,
+            command(PEER_A, Protocol.EVENT_LEAVE, counter = 3, seq = 40),
+        )
+
+        assertTrue("dropped at once", h.engine.snapshot(h.now).peers.isEmpty())
+        assertEquals(listOf(PEER_A), h.recorder.departed)
+        assertEquals(
+            "and the news is passed on, like any other group command",
+            listOf(Protocol.EVENT_LEAVE to PEER_A), h.recorder.relays,
+        )
+
+        // Long past every timeout that could have accused it of vanishing.
+        h.advance(60_000, stepMs = 1_000)
+        assertFalse("leaving is not theft", h.recorder.alarmed)
+        assertTrue(h.engine.snapshot(h.now).peers.isEmpty())
+    }
+
+    /**
+     * The departing phone's last beacons are still in the air when its farewell
+     * lands, and so are the relays. Without a memory of who has left, the peer
+     * is dropped and immediately recreated by its own echo — and the relay, no
+     * longer recognised as one already seen, is passed on again by everybody.
+     */
+    @Test
+    fun `a farewell cannot be undone by what is still in the air`() {
+        val h = Harness()
+        h.armAndSettle(listOf(PEER_A))
+
+        var seq = 40
+        h.engine.onPeerBeacon(
+            h.now, -60, command(PEER_A, Protocol.EVENT_LEAVE, counter = 3, seq = ++seq),
+        )
+
+        h.advance(10_000, stepMs = 500) { t ->
+            // Straggling telemetry from the phone that left...
+            h.engine.onPeerBeacon(t, -60, beacon(PEER_A, seq = ++seq))
+            // ...and somebody else still relaying its farewell.
+            h.engine.onPeerBeacon(
+                t, -60,
+                command(PEER_B, Protocol.EVENT_LEAVE, origin = PEER_A, counter = 3, seq = ++seq),
+            )
+        }
+
+        assertTrue(
+            "a phone that has left stays left",
+            h.engine.snapshot(h.now).peers.none { it.deviceId == PEER_A },
+        )
+        assertEquals(
+            "and the relay terminates rather than circulating forever",
+            1, h.recorder.relays.count { it.first == Protocol.EVENT_LEAVE },
+        )
     }
 }

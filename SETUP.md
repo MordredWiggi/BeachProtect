@@ -250,12 +250,12 @@ BpGuardService: ALARM THEFT_CONSENSUS subject=41377
 .\tools\test-all.ps1 -Dart        # snapshot decoding + static analysis
 ```
 
-- **58 Kotlin/JUnit tests** cover the detection rules — occlusion suppression,
-  consensus, replay protection, the pickup grace period, and the reaction-time
-  budgets for both the victim and the peer path. These run on the JVM in a
-  couple of seconds and are the fastest way to know you have not broken the
-  logic.
-- **9 Dart tests** cover snapshot decoding, the consensus rule mirror and
+- **106 Kotlin/JUnit tests** cover the detection rules — occlusion suppression,
+  consensus, replay protection, the pickup grace period, the acknowledgement
+  protocol, leaving a group, and the reaction-time budgets for both the victim
+  and the peer path. These run on the JVM in a couple of seconds and are the
+  fastest way to know you have not broken the logic.
+- **15 Dart tests** cover snapshot decoding, the consensus rule mirror and
   first-run completion.
 
 An HTML report is written to
@@ -347,6 +347,12 @@ screen, which is also where a phone goes whenever it has no group.
 4. Leave the app open on every phone. Backgrounded and screen off is fine;
    swiped out of Recents stops that phone's guard entirely.
 
+> **Every phone must be running the same build.** The Bluetooth scan filter
+> matches on the wire version byte, so a phone on an older version does not show
+> up as degraded — it does not show up at all, in either direction. If one phone
+> stubbornly sees nobody after an update, that is the first thing to check.
+> `.\tools\install.ps1` installs to every connected device at once.
+
 Within about ten seconds each phone should list the others under **Group**, and
 the `group beacons` chip at the bottom of the home screen should be counting up.
 Neither phone has to be armed for that.
@@ -356,6 +362,26 @@ out two characters at a time in the beacon's spare bytes, and a phone runs its
 radio fast for the first 25 seconds after meeting somebody new specifically so
 this does not take a minute. Until a name arrives the others show a hexadecimal
 id, and you can always override one locally by tapping it.
+
+### What to watch for now
+
+Three things were fixed in 1.7.0 that are worth checking deliberately, because
+all three only show up with two or more phones:
+
+- **A steady group list.** With everything lying still, the other phones should
+  read "Still, watched" and stay there. A card may pick up a quiet
+  `· not heard for 12s` note when the radio has a bad patch — that is the point,
+  it is an annotation and not a state change. What must *not* happen is cards
+  flipping between two states while nothing is going on.
+- **A clean end to an alarm.** Trigger one (**Panic** is the quickest), then
+  press **False alarm — stop everyone** on any phone. The panel should show
+  *"N of M phones have confirmed"* and disappear once they have. "The group is
+  still alarming" should not come back afterwards — if it does, one of the
+  phones genuinely did not hear the stop, which is worth knowing.
+- **Leaving properly.** Press **Leave this group** on one phone. It shows
+  *"Telling the others you are leaving…"* for a second or two; the other phones
+  should drop it from the list immediately, and — the part that used to go wrong
+  — must **not** raise a "phone vanished" alarm afterwards.
 
 ---
 

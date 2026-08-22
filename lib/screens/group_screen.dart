@@ -152,18 +152,22 @@ class GroupScreen extends StatelessWidget {
                       leading: Icon(
                         Icons.smartphone_rounded,
                         color: snapshot.peers[i].armed &&
-                                !snapshot.peers[i].stale
+                                !snapshot.peers[i].lost
                             ? context.status.armed
                             : context.status.disarmed,
                       ),
                       title: snapshot.peers[i].displayName,
-                      // Same rule as the home screen cards: a peer we cannot
-                      // currently hear is reported as unheard, not as whatever
-                      // it last said.
+                      // Same rule as the home screen cards. A phone nobody has
+                      // heard from in half a minute is reported as unheard
+                      // rather than as whatever it last said; one that is merely
+                      // between scan windows keeps its line and gets a note, so
+                      // an ordinary gap in a duty-cycled radio does not read as
+                      // the group changing its mind.
                       subtitle: switch (snapshot.peers[i]) {
-                        final p when p.stale => 'Not heard from just now',
+                        final p when p.lost => 'Not heard from for a while',
                         final p when p.armed =>
-                          'Guarding  -  ${p.proximity.label.toLowerCase()}',
+                          'Guarding  -  ${p.proximity.label.toLowerCase()}'
+                              '${p.faint ? '  -  faint' : ''}',
                         _ => 'Not guarding',
                       },
                       trailing: const Icon(Icons.edit_rounded, size: 18),
@@ -244,8 +248,8 @@ class GroupScreen extends StatelessWidget {
       builder: (context) => AlertDialog(
         title: const Text('Leave the group?'),
         content: const Text(
-          'This phone stops guarding and forgets the group code. You will need '
-          'the code again to rejoin.',
+          'This phone stops guarding, tells the others it is going, and forgets '
+          'the group code. You will need the code again to rejoin.',
         ),
         actions: [
           TextButton(
@@ -262,9 +266,54 @@ class GroupScreen extends StatelessWidget {
         ],
       ),
     );
-    if (confirmed == true) {
-      await controller.leaveGroup();
-      if (context.mounted) Navigator.of(context).pop();
-    }
+    if (confirmed != true) return;
+
+    // Deliberately blocking, with something on screen saying why. Leaving is a
+    // conversation rather than a switch: the guard stands down, broadcasts a
+    // farewell, and waits to be acknowledged before it forgets the group key
+    // that signs it. Returning instantly and doing that in the background would
+    // mean a phone put straight back in a pocket never told anyone — and a
+    // departure nobody hears is indistinguishable from a phone being stolen.
+    if (!context.mounted) return;
+    final navigator = Navigator.of(context);
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const _LeavingDialog(),
+    );
+    await controller.leaveGroup();
+    // Two pops: the progress dialog, then this screen.
+    navigator.pop();
+    navigator.pop();
+  }
+}
+
+class _LeavingDialog extends StatelessWidget {
+  const _LeavingDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      content: Row(
+        children: [
+          const SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(strokeWidth: 2.5),
+          ),
+          const SizedBox(width: 18),
+          Expanded(
+            child: Text(
+              'Telling the others you are leaving...',
+              style: TextStyle(
+                fontSize: 14.5,
+                height: 1.35,
+                color: context.colors.onSurface.withValues(alpha: 0.8),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }

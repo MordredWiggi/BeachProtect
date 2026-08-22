@@ -47,7 +47,9 @@ class BeaconComposerTest {
         alarming: Boolean = false,
         alarmEvent: Int = Protocol.EVENT_ALARM,
         alarmSubject: Int = Protocol.DEVICE_ID_NONE,
+        alarmCounter: Int = 0,
         votes: List<Pair<Int, Int>> = emptyList(),
+        acks: List<Pair<Int, Int>> = emptyList(),
         allowName: Boolean = false,
         name: String = "",
     ): Beacon {
@@ -60,7 +62,9 @@ class BeaconComposerTest {
                 alarming = alarming,
                 alarmEvent = alarmEvent,
                 alarmSubject = alarmSubject,
+                alarmCounter = alarmCounter,
                 votes = votes,
+                acks = acks,
                 allowName = allowName,
                 name = name,
             ),
@@ -103,8 +107,55 @@ class BeaconComposerTest {
         val beacon = compose(now = 1_000)
         assertEquals(Protocol.EVENT_DISARM_ALL, beacon.eventType)
         assertEquals("the issuer travels with the command", 0x00CC, beacon.subjectId)
-        assertEquals("...and so does which press it was", 42, beacon.commandCounter)
-        assertTrue(beacon.carriesCommand)
+        assertEquals("...and so does which press it was", 42, beacon.counter)
+        assertTrue(beacon.carriesCounter)
+    }
+
+    /**
+     * An alarm is *this* alarm, and that is what makes it answerable.
+     *
+     * Without the counter an incident could only be described by its symptoms —
+     * "an alarm from that phone about this phone" — so a stale echo of an
+     * incident somebody had already stood down was indistinguishable from a
+     * fresh one about the same phone, and there was nothing for anybody to
+     * acknowledge.
+     */
+    @Test
+    fun `an alarm carries the incident it belongs to`() {
+        val beacon = compose(
+            alarming = true, alarmSubject = 0x00BB, alarmCounter = 77,
+        )
+        assertEquals(Protocol.EVENT_ALARM, beacon.eventType)
+        assertEquals(0x00BB, beacon.subjectId)
+        assertEquals(77, beacon.counter)
+        assertTrue(beacon.carriesCounter)
+    }
+
+    @Test
+    fun `an acknowledgement names what it is confirming`() {
+        val beacon = compose(acks = listOf(0x00CC to 42))
+        assertEquals(Protocol.EVENT_ACK, beacon.eventType)
+        assertEquals("who announced it", 0x00CC, beacon.subjectId)
+        assertEquals("...and which announcement of theirs", 42, beacon.counter)
+    }
+
+    /**
+     * A confirmation is what somebody else is *waiting on* before they can stop
+     * transmitting at all, so it must not be starved by a vote - which is only
+     * one observer's standing opinion.
+     */
+    @Test
+    fun `acknowledgements and votes share the slot`() {
+        val seen = (1..8).map {
+            compose(
+                now = it * 100L,
+                votes = listOf(Protocol.EVENT_SUSPECT to 0x00DD),
+                acks = listOf(0x00CC to 42),
+            ).eventType
+        }.toSet()
+
+        assertTrue(seen.contains(Protocol.EVENT_ACK))
+        assertTrue(seen.contains(Protocol.EVENT_SUSPECT))
     }
 
     @Test
